@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+testrom/*.o
+testrom/*.elf
+harness/shadow-run
+build/
+dumps/
+captures/
+shadow_*.png
