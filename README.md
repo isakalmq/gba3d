@@ -160,7 +160,14 @@ are handled too.
 **Camera.** The picture is drawn exactly as on the GBA, letterboxed to the
 window. Models are drawn by a second camera with the same scale (1 unit = 1
 GBA pixel) that looks down at the 3/4 angle of the game's art (adjustable in the
-panel). Each model is placed so its feet land on the entity's screen position.
+panel). Each model is fitted over the rectangle the game draws the character
+in: the server measures the opaque pixels of the entity's sprites every frame
+(`drawn` in the JSON). In the 3/4 view, the bottom of that rectangle is the front
+of the character's footprint and the top is the top of its head. So the model is
+as wide as the art, its front edge sits on the bottom line, and its height is
+chosen so its top reaches the top of the art at the current view angle. The
+model then covers the same pixels as the original sprite, and the layers in
+front of it line up the same way.
 
 In the pygame viewer (`python -m shadow view`) the same entities are drawn as
 an overlay: **E** toggles the overlay and **H** hides the entities' sprites.
@@ -191,8 +198,9 @@ an overlay: **E** toggles the overlay and **H** hides the entities' sprites.
    (`behind`, `front`, `hud`) a `u32 size` and that many bytes of 240x160
    RGBA. A size of 0 means the layer is empty this frame. The JSON holds the
    entity list, camera, game code, frame number, `hidden_oam` (the sprite slots
-   removed) and `front_of` (the entity, priority and slot the split was made
-   for). Send `{"hide_entity_sprites": false}` to get one unsplit frame with the
+   removed), `front_of` (the entity, priority and slot the split was made
+   for) and, per entity, `drawn`: the screen box `[x0, y0, x1, y1]` of its
+   original sprite pixels. Send `{"hide_entity_sprites": false}` to get one unsplit frame with the
    original sprites instead. Any engine (Godot, Unity, Bevy, three.js...) can
    consume this. `shadow/server.py` has `decode_frame()` for Python clients.
 

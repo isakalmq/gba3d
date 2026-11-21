@@ -152,6 +152,7 @@ class SplitResult:
     behind: np.ndarray                  # (H, W, 3)
     front: np.ndarray | None = None     # (H, W, 4) RGBA
     hud: np.ndarray | None = None       # (H, W, 4) RGBA
+    bounds: dict = field(default_factory=dict)   # name -> (x0, y0, x1, y1) of drawn sprite pixels
 
 
 @dataclass
@@ -560,7 +561,7 @@ class Renderer:
         return bgs
 
     def render_split(self, st: GBAState, hide_oam=frozenset(), front_of: tuple[int, int] | None = None,
-                     hud_bgs=frozenset()) -> SplitResult:
+                     hud_bgs=frozenset(), bounds_for: dict | None = None) -> SplitResult:
         """Render at 1x as separate layers, so a client can draw its own models in between.
 
         * behind: the frame without the `hide_oam` sprites and without the `hud_bgs` layers
@@ -571,10 +572,21 @@ class Renderer:
         * hud:    RGBA; opaque where one of `hud_bgs` (screen UI such as text boxes) is on top.
 
         Drawing behind, then the models, then front, then hud reproduces the game's layer order.
+
+        `bounds_for` maps names to OAM slots; `bounds` then holds the screen box
+        (x0, y0, x1 exclusive, y1 exclusive) of those sprites' opaque pixels, whether or not
+        something covers them. Clients use it to fit a model over the original art.
         """
         if st.dispcnt & 0x80:
             return SplitResult(np.full((H, W, 3), 255, np.uint8))
         self._prepare(st)
+        bounds = {}
+        if bounds_for:
+            planned = self._plan_sprites()
+            for name, slots in bounds_for.items():
+                box = self._drawn_box([sp for sp in planned if sp.info.index in set(slots)])
+                if box is not None:
+                    bounds[name] = box
         bgs = self._backgrounds()
         sprites = self._plan_sprites(hide_oam)
         rgb, _ = self._evaluate(bgs, sprites, self._grid, hires=False)
@@ -591,7 +603,16 @@ class Renderer:
         behind = rgb
         if hud_img is not None:
             behind, _ = self._evaluate([bg for bg in bgs if bg.bit not in hud_bgs], sprites, self._grid, hires=False)
-        return SplitResult(behind.reshape(H, W, 3), front, hud_img)
+        return SplitResult(behind.reshape(H, W, 3), front, hud_img, bounds)
+
+    def _drawn_box(self, sprites: list[_Sprite]) -> tuple[int, int, int, int] | None:
+        if not sprites:
+            return None
+        drawn = self._sample_sprites(sprites, self._grid, False)[1].reshape(H, W)
+        if not drawn.any():
+            return None
+        ys, xs = np.nonzero(drawn)
+        return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
 
     def render(self, st: GBAState, hide_oam=frozenset()) -> RenderResult:
         """Render `st`. OAM slots in `hide_oam` are left out (e.g. sprites an entity renderer replaces)."""

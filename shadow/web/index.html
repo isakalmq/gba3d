@@ -101,24 +101,42 @@ function groundFromScreen(sx, sy, out) {
   return out.set(sx - W / 2, 0, (sy - H / 2) / Math.sin(THREE.MathUtils.degToRad(angle)));
 }
 
+// Fit a box model over the screen rectangle the game drew the character in
+// ("drawn": x0, y0, x1, y1). In the game's 3/4 view the bottom of the art is the
+// front of the character's footprint and the top of the art is the top of its
+// head, so: width = art width, front edge on the bottom line, and a height that
+// makes the projected top reach the top of the art.
+function fitBox([x0, y0, x1, y1]) {
+  const t = THREE.MathUtils.degToRad(angle), sin = Math.sin(t), cos = Math.cos(t);
+  const w = Math.max(4, x1 - x0), tall = Math.max(4, y1 - y0);
+  let d = w;                                      // square footprint (turns in place)
+  if (tall - d * sin < 4 * cos) d = Math.max(2, (tall - 4 * cos) / sin);
+  const h = Math.max(4, (tall - d * sin) / cos);
+  return { w, d, h, cx: (x0 + x1) / 2, bottom: y1 };
+}
+
 const COLORS = { player: 0xff5ca8 };
 const FACING_YAW = { down: 0, right: Math.PI / 2, up: Math.PI, left: -Math.PI / 2 };
 const actors = new Map();
 
 function makeActor(e) {
-  const size = Math.max(8, (e.size ? e.size[0] : 16) * 0.85);
   const group = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(size, size, size),
+  const body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
     new THREE.MeshStandardMaterial({ color: COLORS[e.kind] ?? 0x5cc8ff, roughness: 0.5 }));
-  const nose = new THREE.Mesh(new THREE.ConeGeometry(size * 0.22, size * 0.45, 16),
-    new THREE.MeshStandardMaterial({ color: 0xffffff }));
+  const nose = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 16), new THREE.MeshStandardMaterial({ color: 0xffffff }));
   nose.rotation.x = Math.PI / 2;
-  nose.position.set(0, 0.1 * size, size * 0.6);
-  body.add(nose);
-  group.add(body);
-  group.userData = { size, screen: [0, 0], shown: [0, 0], yaw: 0, moving: false, phase: 0, body, fresh: true };
+  group.add(body, nose);
+  group.userData = { box: [0, 0, 0, 0], shown: null, yaw: 0, moving: false, phase: 0, body, nose };
   modelScene.add(group);
   return group;
+}
+
+// Screen box for an entity: the drawn art if the server measured it, else a
+// box of the sprite's size standing on the anchor point.
+function entityBox(e) {
+  if (e.drawn) return e.drawn;
+  const [w, h] = e.size ?? [16, 16];
+  return [e.screen[0] - w / 2, e.screen[1] - h, e.screen[0] + w / 2, e.screen[1]];
 }
 
 function updateActors(entities) {
@@ -128,8 +146,8 @@ function updateActors(entities) {
     seen.add(e.id);
     const a = actors.get(e.id) ?? actors.set(e.id, makeActor(e)).get(e.id);
     const d = a.userData;
-    d.screen = e.screen;
-    if (d.fresh) { d.shown = [...e.screen]; d.fresh = false; }
+    d.box = entityBox(e);
+    d.shown ??= [...d.box];
     if (e.facing in FACING_YAW) d.yaw = FACING_YAW[e.facing];
     d.moving = e.moving;
   }
@@ -161,7 +179,7 @@ function connect() {
       pos += size;
     }
     updateActors(meta.entities);
-    lastMeta = meta;
+    lastMeta = window.lastMeta = meta;
     frames++;
   };
   ws.onclose = () => { $("status").textContent = "disconnected - retrying…"; $("status").className = ""; setTimeout(connect, 1000); };
@@ -186,6 +204,9 @@ function resize() { renderer.setSize(window.innerWidth, window.innerHeight); }
 window.addEventListener("resize", resize);
 resize();
 
+// For tests and debugging: window.gbaShadow.picture = false hides the game picture.
+const debug = window.gbaShadow = { picture: true };
+
 const clock = new THREE.Clock();
 const tmp = new THREE.Vector3();
 renderer.setAnimationLoop(() => {
@@ -193,14 +214,21 @@ renderer.setAnimationLoop(() => {
   for (const a of actors.values()) {
     const d = a.userData;
     const k = 1 - Math.exp(-dt * 30);                  // smooth out 60 Hz steps
-    d.shown[0] += (d.screen[0] - d.shown[0]) * k;
-    d.shown[1] += (d.screen[1] - d.shown[1]) * k;
-    a.position.copy(groundFromScreen(d.shown[0], d.shown[1], tmp));
+    for (let i = 0; i < 4; i++) d.shown[i] += (d.box[i] - d.shown[i]) * k;
+    const f = fitBox(d.shown);
+    // Front edge of the footprint on the art's bottom line.
+    a.position.copy(groundFromScreen(f.cx, f.bottom, tmp));
+    a.position.z -= f.d / 2;
     let dy = d.yaw - a.rotation.y;
     dy = Math.atan2(Math.sin(dy), Math.cos(dy));
     a.rotation.y += dy * (1 - Math.exp(-dt * 15));
     d.phase = d.moving ? d.phase + dt * 14 : 0;
-    d.body.position.y = d.size / 2 + Math.abs(Math.sin(d.phase)) * d.size * 0.12;
+    const bob = Math.abs(Math.sin(d.phase)) * Math.min(1.5, f.h * 0.06);
+    d.body.scale.set(f.w, f.h, f.d);
+    d.body.position.y = f.h / 2 + bob;
+    const r = Math.max(1, Math.min(f.w, f.h) * 0.18);
+    d.nose.scale.set(r, r, r);
+    d.nose.position.set(0, f.h * 0.6 + bob, f.d / 2 + r);
   }
 
   // Letterbox the 240x160 picture into the window.
@@ -214,6 +242,7 @@ renderer.setAnimationLoop(() => {
   renderer.setScissor(vx, vy, vw, vh);
   renderer.setScissorTest(true);
 
+  layers.behind.mesh.visible &&= debug.picture;
   layers.front.mesh.visible &&= $("front").checked;
   layers.hud.mesh.visible &&= $("hud").checked;
   renderer.render(backScene, screenCam);

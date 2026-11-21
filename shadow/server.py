@@ -131,7 +131,11 @@ class FrameServer:
         hud_bgs = getattr(adapter, "hud_bgs", frozenset()) if adapter else frozenset()
         split = self.renderer.render_split(
             st, hide_oam=hidden, front_of=(front_of["priority"], front_of["slot"]) if front_of else None,
-            hud_bgs=hud_bgs)
+            hud_bgs=hud_bgs, bounds_for={e.id: e.oam for e in world.entities if e.oam})
+        # "drawn": screen box of the entity's original sprite pixels (x0, y0, x1, y1), so a
+        # client can fit its model over exactly the area the game draws the character in.
+        for e in meta["entities"]:
+            e["drawn"] = split.bounds.get(e["id"])
         return encode_frame({**meta, "hidden_oam": sorted(hidden), "front_of": front_of},
                             {"behind": split.behind, "front": split.front, "hud": split.hud})
 

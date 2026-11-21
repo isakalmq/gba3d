@@ -152,3 +152,24 @@ def test_split_hud_layer():
     r.render(st, hide_oam={1})
     assert split.hud is not None
     np.testing.assert_array_equal(split.hud[..., 3].ravel() == 255, r._top[0] == 3)
+
+
+def test_split_reports_drawn_bounds_of_sprites():
+    st = load_capture(_scene0_captures()[0])
+    r = Renderer()
+    r._prepare(st)
+    planned = {sp.info.index: sp for sp in r._plan_sprites()}
+    slots = [i for i, sp in planned.items() if not sp.info.affine and sp.info.mode == 0]
+    split = r.render_split(st, bounds_for={i: [i] for i in slots})
+    for i in slots:
+        sp = planned[i]
+        alpha = sp.src1[..., 3] > 0
+        if sp.vflip:
+            alpha = alpha[::-1]
+        if sp.hflip:
+            alpha = alpha[:, ::-1]
+        ys, xs = np.nonzero(alpha)
+        x0, y0 = sp.info.x + xs.min(), sp.info.y + ys.min()
+        x1, y1 = sp.info.x + xs.max() + 1, sp.info.y + ys.max() + 1
+        expected = (max(0, x0), max(0, y0), min(240, x1), min(160, y1))
+        assert split.bounds[i] == expected, i

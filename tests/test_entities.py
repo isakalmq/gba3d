@@ -210,7 +210,8 @@ def test_server_end_to_end():
         assert meta["hidden_oam"] == [0]
         prio = (int(video.oam16[2]) >> 10) & 3
         assert meta["front_of"] == {"entity": "player", "priority": prio, "slot": 0}
-        split = Renderer().render_split(video, hide_oam={0}, front_of=(prio, 0))
+        split = Renderer().render_split(video, hide_oam={0}, front_of=(prio, 0), bounds_for={"p": [0]})
+        assert p["drawn"] == list(split.bounds["p"])      # box of the player's original sprite pixels
         np.testing.assert_array_equal(layers["behind"][..., :3], split.behind)
         assert (layers["front"] is None) == (split.front is None)
         assert layers["hud"] is None                       # the test ROM adapter has no UI layer
