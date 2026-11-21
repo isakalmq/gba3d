@@ -67,6 +67,7 @@ class Adapter(Protocol):
     game_codes: tuple[str, ...]
     ram_ranges: list[tuple[int, int]]     # (bus address, length) to stream
     ram_delay: int                        # frames RAM runs ahead of the picture (0 or 1)
+    hud_bgs: frozenset                    # BG layers that are screen UI (drawn above models)
 
     def extract(self, st: GBAState) -> tuple[list[Entity], dict | None]:
         """Entities and camera for this frame. May raise MemoryNotWatched."""

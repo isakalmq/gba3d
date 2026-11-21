@@ -44,8 +44,9 @@ patterns.*
   the sprite slots that draw them). Included: **Pokémon Emerald (US), player
   only**, and the test ROM.
 - **WebSocket output + 3D demo** (`python -m shadow serve`): publishes every
-  frame plus its entities. A three.js page lays the game screen flat and stands a
-  cube on each entity in place of its sprite.
+  frame plus its entities, split into layers behind and in front of the player
+  plus UI. A three.js page shows the game from its original point of view, with
+  a cube in place of each entity's sprite, drawn in the game's own layer order.
 
 ## Quick start
 
@@ -133,13 +134,33 @@ Viewer keys: **B** sprite boxes (green = replaced, yellow = original, blue = OBJ
 python -m shadow serve
 ```
 
-![three.js client: the test ROM's screen as a floor, a cube in place of the player sprite](docs/3d-client.png)
+![three.js client on the test ROM: a cube replaces the player sprite; left, layers that are in front of the player (priority-0 tiles and a sprite) still cover it; right, the same frame with that layer switched off](docs/3d-client.png)
 
-Load the bridge in mGBA as usual and open http://127.0.0.1:8765. The game
-screen is drawn as a floor with the player's sprite removed, and a cube with a
-"nose" stands where the player is, turning with the player's facing and bobbing
-while walking. The panel shows the live entity data. The page loads three.js
-from jsDelivr, so the browser needs internet access.
+Load the bridge in mGBA as usual (or use `./start.py`, which does it all) and
+open http://127.0.0.1:8765. The page shows the game from the original point of
+view, with the player's sprite replaced by a cube. The cube has a "nose" showing
+which way the player faces, and it bobs while walking. The panel shows the live
+entity data and has switches for each layer. The page loads three.js from
+jsDelivr, so the browser needs internet access.
+
+**Draw order.** The game picture isn't one flat image. The server splits it the
+way the GBA layers it, relative to the player's sprite:
+
+- **behind:** everything the GBA draws behind the player
+- **front:** what it draws in front of the player: map layers with a lower
+  priority number, such as Emerald's bed covers, roofs and treetops, and other
+  sprites with better priority or an earlier sprite slot
+- **hud:** layers the adapter marks as screen UI (Emerald: BG0, the text boxes and menus)
+
+The client draws behind, then the 3D models, then front, then hud, which is
+the game's own order. Priorities are read from the player's sprite every frame,
+so elevation changes (bridges, where Emerald raises the player to priority 1)
+are handled too.
+
+**Camera.** The picture is drawn exactly as on the GBA, letterboxed to the
+window. Models are drawn by a second camera with the same scale (1 unit = 1
+GBA pixel) that looks down at the 3/4 angle of the game's art (adjustable in the
+panel). Each model is placed so its feet land on the entity's screen position.
 
 In the pygame viewer (`python -m shadow view`) the same entities are drawn as
 an overlay: **E** toggles the overlay and **H** hides the entities' sprites.
@@ -166,11 +187,14 @@ an overlay: **E** toggles the overlay and **H** hides the entities' sprites.
    | `props`  | everything else the adapter knows |
 
 4. `serve` sends one binary WebSocket message per frame on `/ws`:
-   `u32 json_length | JSON | RGBA 240x160`. The JSON is the entity list,
-   camera, game code and frame number. The image is the frame re-rendered with
-   the entities' sprites removed (send `{"hide_entity_sprites": false}` to keep
-   them). Any engine (Godot, Unity, Bevy, three.js...) can consume it.
-   `shadow/server.py` has `decode_frame()` for Python clients.
+   `u32 json_length | JSON`, then for each name in `JSON.layers`
+   (`behind`, `front`, `hud`) a `u32 size` and that many bytes of 240x160
+   RGBA. A size of 0 means the layer is empty this frame. The JSON holds the
+   entity list, camera, game code, frame number, `hidden_oam` (the sprite slots
+   removed) and `front_of` (the entity, priority and slot the split was made
+   for). Send `{"hide_entity_sprites": false}` to get one unsplit frame with the
+   original sprites instead. Any engine (Godot, Unity, Bevy, three.js...) can
+   consume this. `shadow/server.py` has `decode_frame()` for Python clients.
 
 **Timing.** Pokémon, like most games, runs its logic and then copies sprite
 positions to the hardware in the *next* VBlank. RAM read at VBlank is therefore
@@ -280,6 +304,12 @@ but a full HD pack at 60 fps needs the GPU port listed below.
   The hashing/plan step stays on the CPU.
 - **Bitmap modes (3–5)** aren't replaceable (there are no tiles to identify), and
   **mosaic** and the per-line sprite pixel budget aren't emulated.
+- **Layering approximations.** The front/behind split is made relative to one
+  entity (the player). Other entities' models are ordered against each other
+  by 3D depth. Layers that are alpha-blended over the player (some text boxes)
+  cover the model fully instead of blending. Screen fades done through
+  palettes (most of Emerald's) darken the picture but not the models. The
+  server would need to pass the fade level along for that.
 - **More entities.** The Emerald adapter only covers the player. NPCs are the
   same `gObjectEvents` table (and the same maths), so they're the natural next
   step, followed by a RAM inspector tool for games without a decompilation.

@@ -59,6 +59,9 @@ class PokemonEmeraldAdapter:
         (G_SAVEBLOCK1_PTR, G_TOTAL_CAMERA_PIXEL_OFFSET_X + 2 - G_SAVEBLOCK1_PTR),
     ]
     ram_delay = 1
+    # Overworld BGs (sOverworldBgTemplates): BG0 = text boxes / menus (priority 0),
+    # BG1 = map top layer (1), BG2/BG3 = map middle/bottom layers (2/3).
+    hud_bgs = frozenset({0})
 
     def extract(self, st: GBAState):
         if (st.u32(G_MAIN + 4) & ~1) != CB2_OVERWORLD:

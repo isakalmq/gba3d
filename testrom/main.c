@@ -266,7 +266,7 @@ static void update_sprites(int scene, s32 t) {
 
     // 0: 32x32 "player" moving across the left edge (exercises 9-bit X wrap)
     s32 px = (t * 2) % 300 - 30;
-    set_obj(0, A0(20, 0, 0, 0, 0, 0), A1(px, 0, 0, 2), A2(512, 0, 1));
+    set_obj(0, A0(20, 0, 0, 0, 0, 0), A1(px, 0, 0, 2), A2(512, 1, 1));   // priority 1: BG3 + sprite 12 pass in front
     ENTITIES[0].active = 1;
     ENTITIES[0].kind = 1;
     ENTITIES[0].facing = 4;

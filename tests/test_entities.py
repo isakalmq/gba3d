@@ -159,11 +159,15 @@ def test_emerald_not_in_overworld():
 
 # -- WebSocket server -------------------------------------------------------------------
 def test_frame_encoding_roundtrip():
-    img = np.random.default_rng(1).integers(0, 255, (160, 240, 3), np.uint8)
-    meta, rgba = decode_frame(encode_frame({"frame": 3, "entities": []}, img))
-    assert meta["frame"] == 3 and meta["width"] == 240
-    np.testing.assert_array_equal(rgba[..., :3], img)
-    assert (rgba[..., 3] == 255).all()
+    rng = np.random.default_rng(1)
+    img = rng.integers(0, 255, (160, 240, 3), np.uint8)
+    hud = rng.integers(0, 255, (160, 240, 4), np.uint8)
+    meta, layers = decode_frame(encode_frame({"frame": 3, "entities": []}, {"behind": img, "front": None, "hud": hud}))
+    assert meta["frame"] == 3 and meta["width"] == 240 and meta["layers"] == ["behind", "front", "hud"]
+    np.testing.assert_array_equal(layers["behind"][..., :3], img)
+    assert (layers["behind"][..., 3] == 255).all()
+    assert layers["front"] is None
+    np.testing.assert_array_equal(layers["hud"], hud)
 
 
 def test_server_end_to_end():
@@ -198,14 +202,18 @@ def test_server_end_to_end():
         with connect(f"ws://127.0.0.1:{server.http_port}/ws") as ws:
             time.sleep(0.2)                       # let the server register the client
             bridge.sendall(frame)
-            meta, rgba = decode_frame(ws.recv(timeout=10))
+            meta, layers = decode_frame(ws.recv(timeout=10))
         bridge.close()
         assert meta["game"] == "STST" and meta["frame"] == 77
         (p,) = meta["entities"]
         assert p["id"] == "player" and p["screen"] == [56, 92] and p["facing"] == "left"
         assert meta["hidden_oam"] == [0]
-        expected = Renderer().render(video, hide_oam={0}).image
-        np.testing.assert_array_equal(rgba[..., :3], expected)
+        prio = (int(video.oam16[2]) >> 10) & 3
+        assert meta["front_of"] == {"entity": "player", "priority": prio, "slot": 0}
+        split = Renderer().render_split(video, hide_oam={0}, front_of=(prio, 0))
+        np.testing.assert_array_equal(layers["behind"][..., :3], split.behind)
+        assert (layers["front"] is None) == (split.front is None)
+        assert layers["hud"] is None                       # the test ROM adapter has no UI layer
     finally:
         loop.call_soon_threadsafe(server.stop)
         thread.join(5)

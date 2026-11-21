@@ -5,73 +5,102 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>gba-shadow 3D</title>
 <style>
-  :root { --bg: #111318; --panel: rgba(17, 19, 24, 0.85); --text: #e6e8ee; --muted: #9aa0ad; --accent: #ff5ca8; }
+  :root { --bg: #0b0c10; --panel: rgba(17, 19, 24, 0.88); --text: #e6e8ee; --muted: #9aa0ad; }
   html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
     font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
   canvas { display: block; }
-  #panel { position: fixed; top: 12px; left: 12px; max-width: min(360px, calc(100vw - 48px));
-    background: var(--panel); border: 1px solid #2a2e38; border-radius: 8px; padding: 10px 12px; }
-  #panel h1 { font-size: 14px; margin: 0 0 6px; }
-  #status { color: var(--muted); margin-bottom: 8px; }
+  details { position: fixed; top: 10px; left: 10px; max-width: min(340px, calc(100vw - 40px));
+    background: var(--panel); border: 1px solid #2a2e38; border-radius: 8px; padding: 6px 10px; }
+  summary { cursor: pointer; font-weight: 600; }
+  #status { color: var(--muted); margin: 6px 0; }
   #status.ok { color: #7bd88f; }
-  label { display: flex; align-items: center; gap: 8px; margin: 4px 0; }
+  label { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
   input[type=range] { flex: 1; }
-  pre { margin: 8px 0 0; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
-    white-space: pre-wrap; color: var(--muted); max-height: 40vh; overflow: auto; }
+  pre { margin: 6px 0 0; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; color: var(--muted); max-height: 35vh; overflow: auto; }
 </style>
 <script type="importmap">
   { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
 </script>
 </head>
 <body>
-<div id="panel">
-  <h1>gba-shadow 3D</h1>
+<details open>
+  <summary>gba-shadow 3D</summary>
   <div id="status">connecting…</div>
+  <label><input id="models" type="checkbox" checked> 3D models</label>
   <label><input id="hide" type="checkbox" checked> hide original entity sprites</label>
-  <label>tilt <input id="tilt" type="range" min="0" max="80" value="50"></label>
+  <label><input id="front" type="checkbox" checked> layers in front of models</label>
+  <label><input id="hud" type="checkbox" checked> UI layer (text boxes, menus)</label>
+  <label>model view angle <input id="angle" type="range" min="15" max="85" value="40"></label>
   <pre id="info"></pre>
-</div>
+</details>
 <script type="module">
 import * as THREE from "three";
 
+// The game picture stays exactly as on the GBA (240x160, letterboxed to the
+// window). Models are drawn by a separate orthographic camera that looks down
+// at a 3/4 angle like the game's art, at the same scale (1 unit = 1 GBA pixel),
+// and are placed so their feet land on the entity's screen position. Draw order:
+// behind -> models -> front -> hud, which is the game's own layer order.
 const W = 240, H = 160;
-const statusEl = document.getElementById("status");
-const infoEl = document.getElementById("info");
-const hideEl = document.getElementById("hide");
-const tiltEl = document.getElementById("tilt");
+const $ = (id) => document.getElementById(id);
 
-// --- scene: the GBA picture lies flat as a floor, entities stand on it -------
 const renderer = new THREE.WebGLRenderer({ antialias: true });
 renderer.setPixelRatio(window.devicePixelRatio);
+renderer.autoClear = false;
+renderer.setClearColor(0x0b0c10);
 document.body.appendChild(renderer.domElement);
 
-const scene = new THREE.Scene();
-scene.background = new THREE.Color(0x111318);
-const camera = new THREE.PerspectiveCamera(40, 1, 1, 2000);
+// --- screen-space layers -------------------------------------------------------
+const screenCam = new THREE.OrthographicCamera(0, W, 0, -H, -10, 10);
+function makeLayer(scene, order) {
+  const data = new Uint8Array(W * H * 4);
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
+  tex.magFilter = tex.minFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const geo = new THREE.PlaneGeometry(W, H);
+  const uv = geo.attributes.uv;                // image rows run top -> bottom
+  for (let i = 0; i < uv.count; i++) uv.setY(i, 1 - uv.getY(i));
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  mesh.position.set(W / 2, -H / 2, 0);
+  mesh.renderOrder = order;
+  mesh.visible = false;
+  scene.add(mesh);
+  return { data, tex, mesh };
+}
+const backScene = new THREE.Scene();
+const overlayScene = new THREE.Scene();
+const layers = {
+  behind: makeLayer(backScene, 0),
+  front: makeLayer(overlayScene, 1),
+  hud: makeLayer(overlayScene, 2),
+};
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.55));
-const sun = new THREE.DirectionalLight(0xffffff, 1.6);
-sun.position.set(-80, 200, 120);
-scene.add(sun);
+// --- models ----------------------------------------------------------------------
+const modelScene = new THREE.Scene();
+const modelCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -4000, 4000);
+modelScene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(-1, 2, 1.5);
+modelScene.add(sun);
 
-const pixels = new Uint8Array(W * H * 4);
-const texture = new THREE.DataTexture(pixels, W, H, THREE.RGBAFormat);
-texture.magFilter = THREE.NearestFilter;
-texture.minFilter = THREE.NearestFilter;
-texture.colorSpace = THREE.SRGBColorSpace;
-const floorGeo = new THREE.PlaneGeometry(W, H);
-const uv = floorGeo.attributes.uv;            // image rows run top -> bottom
-for (let i = 0; i < uv.count; i++) uv.setY(i, 1 - uv.getY(i));
-const floor = new THREE.Mesh(floorGeo, new THREE.MeshBasicMaterial({ map: texture }));
-floor.rotation.x = -Math.PI / 2;               // screen (x, y) -> world (x - 120, 0, y - 80)
-scene.add(floor);
+let angle = 40;
+function setAngle(deg) {
+  angle = deg;
+  const t = THREE.MathUtils.degToRad(deg);
+  modelCam.position.set(0, Math.sin(t) * 1000, Math.cos(t) * 1000);
+  modelCam.lookAt(0, 0, 0);
+}
+setAngle(Number($("angle").value));
+$("angle").oninput = (e) => setAngle(Number(e.target.value));
 
-const frameEdge = new THREE.LineSegments(
-  new THREE.EdgesGeometry(new THREE.BoxGeometry(W, 0.01, H)),
-  new THREE.LineBasicMaterial({ color: 0x3a3f4b }));
-scene.add(frameEdge);
+// Ground point under a screen position: x maps 1:1, screen y is foreshortened
+// depth (z) as seen by the tilted camera.
+function groundFromScreen(sx, sy, out) {
+  return out.set(sx - W / 2, 0, (sy - H / 2) / Math.sin(THREE.MathUtils.degToRad(angle)));
+}
 
-// --- entities: a cube with a "nose" pointing where the entity faces -----------
 const COLORS = { player: 0xff5ca8 };
 const FACING_YAW = { down: 0, right: Math.PI / 2, up: Math.PI, left: -Math.PI / 2 };
 const actors = new Map();
@@ -81,14 +110,14 @@ function makeActor(e) {
   const group = new THREE.Group();
   const body = new THREE.Mesh(new THREE.BoxGeometry(size, size, size),
     new THREE.MeshStandardMaterial({ color: COLORS[e.kind] ?? 0x5cc8ff, roughness: 0.5 }));
-  body.position.y = size / 2;
   const nose = new THREE.Mesh(new THREE.ConeGeometry(size * 0.22, size * 0.45, 16),
     new THREE.MeshStandardMaterial({ color: 0xffffff }));
   nose.rotation.x = Math.PI / 2;
-  nose.position.set(0, size * 0.6, size * 0.6);
-  group.add(body, nose);
-  group.userData = { size, target: new THREE.Vector3(), yaw: 0, moving: false, phase: 0, body };
-  scene.add(group);
+  nose.position.set(0, 0.1 * size, size * 0.6);
+  body.add(nose);
+  group.add(body);
+  group.userData = { size, screen: [0, 0], shown: [0, 0], yaw: 0, moving: false, phase: 0, body, fresh: true };
+  modelScene.add(group);
   return group;
 }
 
@@ -97,74 +126,102 @@ function updateActors(entities) {
   for (const e of entities) {
     if (!e.screen) continue;
     seen.add(e.id);
-    let a = actors.get(e.id);
-    if (!a) { a = makeActor(e); actors.set(e.id, a); a.position.set(e.screen[0] - W / 2, 0, e.screen[1] - H / 2); }
+    const a = actors.get(e.id) ?? actors.set(e.id, makeActor(e)).get(e.id);
     const d = a.userData;
-    d.target.set(e.screen[0] - W / 2, 0, e.screen[1] - H / 2 - d.size / 2);
+    d.screen = e.screen;
+    if (d.fresh) { d.shown = [...e.screen]; d.fresh = false; }
     if (e.facing in FACING_YAW) d.yaw = FACING_YAW[e.facing];
     d.moving = e.moving;
   }
-  for (const [id, a] of actors) {
-    if (!seen.has(id)) { scene.remove(a); actors.delete(id); }
-  }
+  for (const [id, a] of actors) if (!seen.has(id)) { modelScene.remove(a); actors.delete(id); }
 }
 
-// --- networking ----------------------------------------------------------------
+// --- networking ----------------------------------------------------------------------
 let ws, frames = 0, lastMeta = null;
+const sendSettings = () => ws?.readyState === 1 && ws.send(JSON.stringify({ hide_entity_sprites: $("hide").checked }));
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
-  ws.onopen = () => { ws.send(JSON.stringify({ hide_entity_sprites: hideEl.checked })); };
+  ws.onopen = sendSettings;
   ws.onmessage = (ev) => {
     const view = new DataView(ev.data);
     const n = view.getUint32(0, true);
     const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
-    pixels.set(new Uint8Array(ev.data, 4 + n, meta.width * meta.height * 4));
-    texture.needsUpdate = true;
+    let pos = 4 + n;
+    for (const name of Object.keys(layers)) layers[name].mesh.visible = false;
+    for (const name of meta.layers) {
+      const size = view.getUint32(pos, true);
+      pos += 4;
+      const layer = layers[name];
+      if (layer && size) {
+        layer.data.set(new Uint8Array(ev.data, pos, size));
+        layer.tex.needsUpdate = true;
+        layer.mesh.visible = true;
+      }
+      pos += size;
+    }
     updateActors(meta.entities);
     lastMeta = meta;
     frames++;
   };
-  ws.onclose = () => { statusEl.textContent = "disconnected - retrying…"; statusEl.className = ""; setTimeout(connect, 1000); };
+  ws.onclose = () => { $("status").textContent = "disconnected - retrying…"; $("status").className = ""; setTimeout(connect, 1000); };
 }
 connect();
-hideEl.onchange = () => ws?.readyState === 1 && ws.send(JSON.stringify({ hide_entity_sprites: hideEl.checked }));
+$("hide").onchange = sendSettings;
 
 setInterval(() => {
-  if (!lastMeta) { statusEl.textContent = "connected - waiting for frames from mGBA…"; return; }
-  statusEl.className = "ok";
-  statusEl.textContent = `${lastMeta.game ?? "?"} · frame ${lastMeta.frame} · ${frames} fps`;
+  if (!lastMeta) { $("status").textContent = "connected - waiting for frames from mGBA…"; return; }
+  $("status").className = "ok";
+  const shown = Object.entries(layers).filter(([, l]) => l.mesh.visible).map(([k]) => k).join(" + ");
+  $("status").textContent = `${lastMeta.game ?? "?"} · frame ${lastMeta.frame} · ${frames} fps · ${shown}`;
   frames = 0;
   const p = lastMeta.entities[0];
-  infoEl.textContent = p ? JSON.stringify(p, null, 1) : (lastMeta.error ?? "no entities (not in the overworld?)");
+  $("info").textContent = p
+    ? JSON.stringify({ ...p, props: undefined, front_of: lastMeta.front_of }, null, 1)
+    : (lastMeta.error ?? "no entities (not in the overworld?)");
 }, 1000);
 
-// --- render loop ---------------------------------------------------------------
-function resize() {
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  camera.aspect = window.innerWidth / window.innerHeight;
-  camera.updateProjectionMatrix();
-}
+// --- render loop -----------------------------------------------------------------------
+function resize() { renderer.setSize(window.innerWidth, window.innerHeight); }
 window.addEventListener("resize", resize);
 resize();
 
 const clock = new THREE.Clock();
+const tmp = new THREE.Vector3();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
-  const tilt = THREE.MathUtils.degToRad(Number(tiltEl.value));
-  const dist = 270;
-  camera.position.set(0, Math.cos(tilt) * dist, Math.sin(tilt) * dist);
-  camera.lookAt(0, 0, 0);
   for (const a of actors.values()) {
     const d = a.userData;
-    a.position.lerp(d.target, 1 - Math.exp(-dt * 25));
+    const k = 1 - Math.exp(-dt * 30);                  // smooth out 60 Hz steps
+    d.shown[0] += (d.screen[0] - d.shown[0]) * k;
+    d.shown[1] += (d.screen[1] - d.shown[1]) * k;
+    a.position.copy(groundFromScreen(d.shown[0], d.shown[1], tmp));
     let dy = d.yaw - a.rotation.y;
     dy = Math.atan2(Math.sin(dy), Math.cos(dy));
     a.rotation.y += dy * (1 - Math.exp(-dt * 15));
     d.phase = d.moving ? d.phase + dt * 14 : 0;
-    d.body.position.y = d.size / 2 + Math.abs(Math.sin(d.phase)) * d.size * 0.15;
+    d.body.position.y = d.size / 2 + Math.abs(Math.sin(d.phase)) * d.size * 0.12;
   }
-  renderer.render(scene, camera);
+
+  // Letterbox the 240x160 picture into the window.
+  const cw = window.innerWidth, ch = window.innerHeight;
+  const s = Math.min(cw / W, ch / H);
+  const vw = W * s, vh = H * s, vx = (cw - vw) / 2, vy = (ch - vh) / 2;
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, cw, ch);
+  renderer.clear();
+  renderer.setViewport(vx, vy, vw, vh);
+  renderer.setScissor(vx, vy, vw, vh);
+  renderer.setScissorTest(true);
+
+  layers.front.mesh.visible &&= $("front").checked;
+  layers.hud.mesh.visible &&= $("hud").checked;
+  renderer.render(backScene, screenCam);
+  if ($("models").checked) {
+    renderer.clearDepth();
+    renderer.render(modelScene, modelCam);
+  }
+  renderer.render(overlayScene, screenCam);
 });
 </script>
 </body>

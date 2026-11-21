@@ -107,3 +107,48 @@ def test_tile_dump_and_replacement(tmp_path):
     assert res.hires_pixels > 0
     cyan = np.all(res.image == (0, 255, 255), axis=-1).mean()
     assert cyan > 0.2
+
+
+def _scene0_captures():
+    return [p for p in CAPTURES if load_capture(p).dispcnt == 0x3F40]   # mode 0, WIN0 keeps OBJ visible
+
+
+@pytest.mark.parametrize("path", _scene0_captures(), ids=lambda p: p.name.split(".")[0])
+def test_split_front_layer_follows_hardware_order(path):
+    st = load_capture(path)
+    r = Renderer()
+    infos = r.render(st).sprites
+    checked = 0
+    for target in [s for s in infos if s.mode == 0]:
+        slot = target.index
+        prio = target.priority
+        r.render(st)
+        top_bit, top_prio, top_slot = r._top
+        visible = (top_bit == 4) & (top_slot == slot)
+        # Hardware quirk: a transparent pixel of a better-priority sprite in a later slot raises
+        # the effective priority of what is under it. The split uses the sprite's own priority,
+        # so leave those few pixels out.
+        quirk = visible & (top_prio != prio)
+        visible &= ~quirk
+        r._prepare(st)
+        only = [s for s in r._plan_sprites() if s.info.index == slot]
+        drawn = r._sample_sprites(only, r._grid, False)[1]
+        split = r.render_split(st, hide_oam={slot}, front_of=(prio, slot))
+        alpha = split.front[..., 3].ravel() if split.front is not None else np.zeros(drawn.shape, np.uint8)
+        assert (alpha[visible] == 0).all(), f"slot {slot}: front layer covers visible sprite pixels"
+        hidden = drawn & ~visible & ~quirk
+        assert (alpha[hidden] == 255).all(), f"slot {slot}: hidden sprite pixels not covered"
+        checked += int(hidden.any())
+    assert checked, "expected at least one partly covered sprite"
+
+
+def test_split_hud_layer():
+    st = load_capture(_scene0_captures()[0])
+    split = Renderer().render_split(st, hide_oam={1}, front_of=(1, 1), hud_bgs={3})
+    without_bg3 = st.copy()
+    without_bg3.io[1] &= 0xF7                   # DISPCNT: BG3 off
+    np.testing.assert_array_equal(split.behind, Renderer().render(without_bg3, hide_oam={1}).image)
+    r = Renderer()
+    r.render(st, hide_oam={1})
+    assert split.hud is not None
+    np.testing.assert_array_equal(split.hud[..., 3].ravel() == 255, r._top[0] == 3)

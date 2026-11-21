@@ -18,6 +18,7 @@ class ShadowTestAdapter:
     game_codes = ("STST",)
     ram_ranges = [(ENTITY_TABLE, ENTITY_SIZE)]
     ram_delay = 1
+    hud_bgs = frozenset()        # no UI layer in the test ROM
 
     def extract(self, st: GBAState):
         base = ENTITY_TABLE

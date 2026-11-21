@@ -4,12 +4,19 @@
 
 Each frame is one binary WebSocket message on /ws:
 
-    u32 json_length | json (UTF-8) | RGBA pixels (width * height * 4)
+    u32 json_length | json (UTF-8) | for each name in json["layers"]: u32 n | n bytes of RGBA
 
-The JSON is World.to_dict() plus "width", "height" and "hidden_oam". The image
-is the game re-rendered at 1x; by default the sprites that belong to entities
-are left out so a client can draw its own models in their place. Clients can
-send {"hide_entity_sprites": false} to get the original sprites back.
+The JSON is World.to_dict() plus "width", "height", "layers", "hidden_oam" and
+"front_of". The images are the game re-rendered at 1x, split so a client can
+draw its own models in the game's own draw order (n = 0 means the layer is empty):
+
+    behind  the frame without the entities' sprites and without UI layers (opaque)
+    front   what the GBA draws in front of the (first) entity's sprite: map layers
+            such as Pokemon's roofs, bed covers and treetops, and other sprites
+    hud     screen UI layers (text boxes, menus), as declared by the adapter
+
+Draw behind, then the models, then front, then hud. Clients can send
+{"hide_entity_sprites": false} to get a single unsplit frame with the original sprites.
 
 GET / serves a small three.js demo client (shadow/web/index.html).
 """
@@ -33,22 +40,42 @@ WEB_DIR = Path(__file__).parent / "web"
 DEFAULT_HTTP_PORT = 8765
 
 
-def encode_frame(world_dict: dict, rgb: np.ndarray) -> bytes:
-    """Pack one frame message. `rgb` is (H, W, 3) uint8."""
-    h, w = rgb.shape[:2]
-    rgba = np.empty((h, w, 4), np.uint8)
-    rgba[..., :3] = rgb
+LAYERS = ("behind", "front", "hud")
+
+
+def _as_rgba(img: np.ndarray) -> np.ndarray:
+    if img.shape[2] == 4:
+        return img
+    rgba = np.empty(img.shape[:2] + (4,), np.uint8)
+    rgba[..., :3] = img
     rgba[..., 3] = 255
-    meta = json.dumps({**world_dict, "width": w, "height": h}).encode()
-    return struct.pack("<I", len(meta)) + meta + rgba.tobytes()
+    return rgba
 
 
-def decode_frame(data: bytes) -> tuple[dict, np.ndarray]:
-    """Inverse of encode_frame (used by tests and Python clients)."""
+def encode_frame(world_dict: dict, layers: dict[str, np.ndarray | None]) -> bytes:
+    """Pack one frame message. `layers` maps name -> (H, W, 3|4) uint8 image or None (empty)."""
+    first = next(img for img in layers.values() if img is not None)
+    h, w = first.shape[:2]
+    meta = json.dumps({**world_dict, "width": w, "height": h, "layers": list(layers)}).encode()
+    parts = [struct.pack("<I", len(meta)), meta]
+    for img in layers.values():
+        data = b"" if img is None else _as_rgba(img).tobytes()
+        parts += [struct.pack("<I", len(data)), data]
+    return b"".join(parts)
+
+
+def decode_frame(data: bytes) -> tuple[dict, dict[str, np.ndarray | None]]:
+    """Inverse of encode_frame (used by tests and Python clients). Images come back as RGBA."""
     (n,) = struct.unpack_from("<I", data)
     meta = json.loads(data[4:4 + n])
-    rgba = np.frombuffer(data, np.uint8, offset=4 + n).reshape(meta["height"], meta["width"], 4)
-    return meta, rgba
+    pos, layers = 4 + n, {}
+    for name in meta["layers"]:
+        (size,) = struct.unpack_from("<I", data, pos)
+        pos += 4
+        layers[name] = (np.frombuffer(data, np.uint8, size, pos).reshape(meta["height"], meta["width"], 4)
+                        if size else None)
+        pos += size
+    return meta, layers
 
 
 class FrameServer:
@@ -88,9 +115,25 @@ class FrameServer:
     # -- frame loop -----------------------------------------------------------
     def _make_frame(self, st) -> bytes:
         world = self.session.world(st)
-        hidden = world.entity_oam if self.hide_entity_sprites else set()
-        image = self.renderer.render(st, hide_oam=hidden).image
-        return encode_frame({**world.to_dict(), "hidden_oam": sorted(hidden)}, image)
+        meta = world.to_dict()
+        if not self.hide_entity_sprites:
+            image = self.renderer.render(st).image
+            return encode_frame({**meta, "hidden_oam": [], "front_of": None}, {"behind": image})
+        hidden = world.entity_oam
+        front_of = None
+        # Layering is computed relative to the first entity that is drawn by sprites
+        # (the player): its sprite priority, and its lowest OAM slot for ties.
+        main = next((e for e in world.entities if e.oam), None)
+        if main:
+            prio = min((int(st.oam16[i * 4 + 2]) >> 10) & 3 for i in main.oam)
+            front_of = {"entity": main.id, "priority": prio, "slot": min(main.oam)}
+        adapter = self.session.adapter
+        hud_bgs = getattr(adapter, "hud_bgs", frozenset()) if adapter else frozenset()
+        split = self.renderer.render_split(
+            st, hide_oam=hidden, front_of=(front_of["priority"], front_of["slot"]) if front_of else None,
+            hud_bgs=hud_bgs)
+        return encode_frame({**meta, "hidden_oam": sorted(hidden), "front_of": front_of},
+                            {"behind": split.behind, "front": split.front, "hud": split.hud})
 
     async def _pump(self) -> None:
         last_seq = -1

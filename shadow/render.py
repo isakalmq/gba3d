@@ -140,6 +140,20 @@ class _BG:
     atlas: np.ndarray | None = None  # (N, 8S, 8S, 4)
 
 
+def _rgba(rgb: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    out = np.zeros((H, W, 4), np.uint8)
+    out[..., :3] = rgb.reshape(H, W, 3)
+    out[..., 3] = np.where(mask, 255, 0).reshape(H, W)
+    return out
+
+
+@dataclass
+class SplitResult:
+    behind: np.ndarray                  # (H, W, 3)
+    front: np.ndarray | None = None     # (H, W, 4) RGBA
+    hud: np.ndarray | None = None       # (H, W, 4) RGBA
+
+
 @dataclass
 class RenderResult:
     image: np.ndarray                                   # (H*S, W*S, 3) uint8
@@ -378,6 +392,7 @@ class Renderer:
         n, S = pts.n, pts.S
         color = np.zeros((n, 3), np.int32)
         prio_l = np.full(n, 4, np.int8)
+        idx_l = np.full(n, 128, np.int16)           # OAM slot that drew each pixel
         written = np.zeros(n, bool)
         semi = np.zeros(n, bool)
         objwin = np.zeros(n, bool)
@@ -425,9 +440,11 @@ class Renderer:
             reprio = upd & ~op & written[sel]
             color[sel[take]] = texel[take, :3]
             written[sel[take]] = True
+            idx_l[sel[take]] = info.index
             changed = sel[take | reprio]
             prio_l[changed] = info.priority
             semi[changed] = info.mode == 1
+        self._obj_index = idx_l
         return color, written, prio_l, semi, objwin, touched
 
     # ----------------------------------------------------------- compositing
@@ -478,6 +495,7 @@ class Renderer:
             ids.append(bit)
         cols = np.arange(n)
         top = keys.argmin(0)
+        top_key = keys[top, cols].copy()
         keys[top, cols] = KEY_NONE
         second = keys.argmin(0)
         second_valid = keys[second, cols] != KEY_NONE
@@ -490,6 +508,10 @@ class Renderer:
         top_c, sec_c = stack[top, cols], stack[second, cols]
         ids_arr = np.array(ids)
         top_bit, sec_bit = ids_arr[top], ids_arr[second]
+        # For splitting a frame into layers: which layer won each point, its
+        # priority (backdrop = 8) and, for sprites, the OAM slot.
+        self._top = (top_bit, top_key // 16,
+                     np.where(top_bit == LAYER_OBJ, self._obj_index, 128) if semi is not None else np.full(n, 128))
 
         bldcnt = st.reg(0x50)
         target1, target2, effect = bldcnt & 0x3F, (bldcnt >> 8) & 0x3F, (bldcnt >> 6) & 3
@@ -521,14 +543,9 @@ class Renderer:
         return out.astype(np.uint8), touched
 
     # ------------------------------------------------------------------ main
-    def render(self, st: GBAState, hide_oam=frozenset()) -> RenderResult:
-        """Render `st`. OAM slots in `hide_oam` are left out (e.g. sprites an entity renderer replaces)."""
-        S = self.scale
-        if st.dispcnt & 0x80:  # forced blank
-            return RenderResult(np.full((H * S, W * S, 3), 255, np.uint8))
-        self._prepare(st)
+    def _backgrounds(self) -> list[_BG]:
+        st = self.st
         dispcnt, mode = st.dispcnt, st.mode
-
         bgs: list[_BG] = []
         for i in range(4):
             if not dispcnt & (0x100 << i):
@@ -540,6 +557,49 @@ class Renderer:
                 bgs.append(_BG(i, "affine", cnt & 3, cnt))
             elif mode in (3, 4, 5) and i == 2:
                 bgs.append(_BG(i, "bitmap", cnt & 3, cnt))
+        return bgs
+
+    def render_split(self, st: GBAState, hide_oam=frozenset(), front_of: tuple[int, int] | None = None,
+                     hud_bgs=frozenset()) -> SplitResult:
+        """Render at 1x as separate layers, so a client can draw its own models in between.
+
+        * behind: the frame without the `hide_oam` sprites and without the `hud_bgs` layers
+        * front:  RGBA; opaque where the GBA would draw something *in front of* a sprite with
+                  priority/OAM slot `front_of` = (priority, slot): BGs with a lower priority
+                  number, sprites with a lower priority number or the same priority and a
+                  lower slot. None if nothing is in front (or `front_of` is None).
+        * hud:    RGBA; opaque where one of `hud_bgs` (screen UI such as text boxes) is on top.
+
+        Drawing behind, then the models, then front, then hud reproduces the game's layer order.
+        """
+        if st.dispcnt & 0x80:
+            return SplitResult(np.full((H, W, 3), 255, np.uint8))
+        self._prepare(st)
+        bgs = self._backgrounds()
+        sprites = self._plan_sprites(hide_oam)
+        rgb, _ = self._evaluate(bgs, sprites, self._grid, hires=False)
+        top_bit, top_prio, top_slot = self._top
+        hud = np.isin(top_bit, list(hud_bgs)) if hud_bgs else np.zeros(len(top_bit), bool)
+        front = None
+        if front_of is not None:
+            prio, slot = front_of
+            in_front = (((top_bit < LAYER_OBJ) & ~hud & (top_prio < prio)) |
+                        ((top_bit == LAYER_OBJ) & ((top_prio < prio) | ((top_prio == prio) & (top_slot < slot)))))
+            if in_front.any():
+                front = _rgba(rgb, in_front)
+        hud_img = _rgba(rgb, hud) if hud.any() else None
+        behind = rgb
+        if hud_img is not None:
+            behind, _ = self._evaluate([bg for bg in bgs if bg.bit not in hud_bgs], sprites, self._grid, hires=False)
+        return SplitResult(behind.reshape(H, W, 3), front, hud_img)
+
+    def render(self, st: GBAState, hide_oam=frozenset()) -> RenderResult:
+        """Render `st`. OAM slots in `hide_oam` are left out (e.g. sprites an entity renderer replaces)."""
+        S = self.scale
+        if st.dispcnt & 0x80:  # forced blank
+            return RenderResult(np.full((H * S, W * S, 3), 255, np.uint8))
+        self._prepare(st)
+        bgs = self._backgrounds()
         sprites = self._plan_sprites(hide_oam)
 
         rgb, touched = self._evaluate(bgs, sprites, self._grid, hires=False)
