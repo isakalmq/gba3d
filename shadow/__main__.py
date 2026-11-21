@@ -1,8 +1,10 @@
 """gba-shadow command line.
 
   python -m shadow view   [--port N] [--scale S] [--pack DIR] [--dump DIR [--dump-tiles]]
+  python -m shadow serve  [--port N] [--http-port N]      (WebSocket + three.js demo client)
   python -m shadow verify CAPTURE_DIR
   python -m shadow render STATE.gbsh -o out.png [--scale S] [--pack DIR]
+  python -m shadow entities STATE.gbsh --game CODE        (print the adapter's view of a capture)
 """
 from __future__ import annotations
 
@@ -27,6 +29,16 @@ def main(argv: list[str] | None = None) -> int:
     v.add_argument("--dump", help="directory to dump never-seen-before sprites into")
     v.add_argument("--dump-tiles", action="store_true", help="also dump BG tiles (slower)")
 
+    w = sub.add_parser("serve", help="publish frames + entities over WebSocket (open the printed URL)")
+    w.add_argument("--host", default="127.0.0.1")
+    w.add_argument("--port", type=int, default=DEFAULT_PORT, help="port the mGBA bridge connects to")
+    w.add_argument("--http-host", default="127.0.0.1")
+    w.add_argument("--http-port", type=int, default=8765, help="port for the web client and /ws")
+
+    e = sub.add_parser("entities", help="print entities extracted from a capture (needs RAM in the capture)")
+    e.add_argument("state")
+    e.add_argument("--game", required=True, help="4-letter game code, e.g. BPEE")
+
     c = sub.add_parser("verify", help="check the renderer against captured mGBA screenshots")
     c.add_argument("capture_dir")
 
@@ -37,6 +49,23 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--pack")
 
     args = ap.parse_args(argv)
+
+    if args.cmd == "serve":
+        from .server import run_server
+        return run_server(args.host, args.port, args.http_host, args.http_port)
+
+    if args.cmd == "entities":
+        import json
+
+        from .entities import extract_world
+        from .games import find_adapter
+        from .protocol import load_capture
+        adapter = find_adapter(args.game)
+        if adapter is None:
+            print(f"no adapter for game code {args.game!r}")
+            return 1
+        print(json.dumps(extract_world(adapter, load_capture(args.state), args.game).to_dict(), indent=2))
+        return 0
 
     if args.cmd == "verify":
         from .verify import verify_dir

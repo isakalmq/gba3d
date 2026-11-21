@@ -319,7 +319,7 @@ class Renderer:
         tiles = (self.obj8 if bpp8 else self.obj4)[units]           # (th, tw, 8, 8)
         return tiles.transpose(0, 2, 1, 3).reshape(h, w), bpp8
 
-    def _plan_sprites(self) -> list[_Sprite]:
+    def _plan_sprites(self, hide_oam=frozenset()) -> list[_Sprite]:
         """Decode, hash and look up replacements for every visible OAM entry (in OAM order)."""
         st, S = self.st, self.scale
         dispcnt = st.dispcnt
@@ -332,6 +332,8 @@ class Renderer:
         use_pack = bool(self.pack and self.replace and self.pack.has_sprites)
         out = []
         for i in range(128):
+            if i in hide_oam:
+                continue
             a0, a1, a2 = int(oam[i * 4]), int(oam[i * 4 + 1]), int(oam[i * 4 + 2])
             affine, flag9 = (a0 >> 8) & 1, (a0 >> 9) & 1
             if not affine and flag9:
@@ -519,7 +521,8 @@ class Renderer:
         return out.astype(np.uint8), touched
 
     # ------------------------------------------------------------------ main
-    def render(self, st: GBAState) -> RenderResult:
+    def render(self, st: GBAState, hide_oam=frozenset()) -> RenderResult:
+        """Render `st`. OAM slots in `hide_oam` are left out (e.g. sprites an entity renderer replaces)."""
         S = self.scale
         if st.dispcnt & 0x80:  # forced blank
             return RenderResult(np.full((H * S, W * S, 3), 255, np.uint8))
@@ -537,7 +540,7 @@ class Renderer:
                 bgs.append(_BG(i, "affine", cnt & 3, cnt))
             elif mode in (3, 4, 5) and i == 2:
                 bgs.append(_BG(i, "bitmap", cnt & 3, cnt))
-        sprites = self._plan_sprites()
+        sprites = self._plan_sprites(hide_oam)
 
         rgb, touched = self._evaluate(bgs, sprites, self._grid, hires=False)
         image = rgb.reshape(H, W, 3)

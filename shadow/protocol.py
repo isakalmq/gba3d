@@ -1,9 +1,13 @@
 """Wire format shared with lua/shadow_bridge.lua, a TCP receiver, and capture loading.
 
-Message (little endian):
+Bridge -> renderer (little endian):
     header  "GBSH" u8 version u8 flags u16 record_count u32 frame u32 payload_len
     record  u8 region u32 offset u32 length, then `length` bytes
-flags bit0 = full snapshot.
+flags bit0 = full snapshot; bit1 = hello (payload: s1 game code, s1 title; no records).
+Regions: 0 IO, 1 palette, 2 VRAM, 3 OAM, 4 EWRAM, 5 IWRAM (offsets relative to the region).
+
+Renderer -> bridge (watch request, replaces the previous one):
+    "GBSW" u8 version u8 flags(bit0 = delay RAM by one frame) u16 count, count x (u32 address, u32 length)
 """
 from __future__ import annotations
 
@@ -12,7 +16,7 @@ import socket
 import struct
 import threading
 from pathlib import Path
-from typing import Iterator
+from typing import Callable, Iterator
 
 import numpy as np
 
@@ -21,8 +25,12 @@ from .state import REGION_SIZES, GBAState
 MAGIC = b"GBSH"
 VERSION = 1
 FLAG_FULL = 1
+FLAG_HELLO = 2
 HEADER = struct.Struct("<4sBBHII")
 RECORD = struct.Struct("<BII")
+WATCH_MAGIC = b"GBSW"
+WATCH_HEADER = struct.Struct("<4sBBH")
+WATCH_RANGE = struct.Struct("<II")
 DEFAULT_PORT = 61337
 
 
@@ -56,10 +64,36 @@ def iter_records(payload: bytes, count: int) -> Iterator[tuple[int, int, memoryv
 def apply_message(state: GBAState, header: bytes, payload: bytes) -> bool:
     """Apply one message to `state` in place. Returns True if it was a full snapshot."""
     flags, count, frame, _ = parse_header(header)
+    if flags & FLAG_HELLO:
+        return False
     for region, offset, data in iter_records(payload, count):
-        state.region(region)[offset:offset + len(data)] = np.frombuffer(data, np.uint8)
+        state.write(region, offset, np.frombuffer(data, np.uint8))
     state.frame = frame
     return bool(flags & FLAG_FULL)
+
+
+def parse_hello(payload: bytes) -> tuple[str, str]:
+    """(game code, title) from a hello payload."""
+    n = payload[0]
+    code = payload[1:1 + n].decode("ascii", "replace")
+    m = payload[1 + n]
+    title = payload[2 + n:2 + n + m].decode("ascii", "replace")
+    return code, title
+
+
+def encode_watch(ranges: list[tuple[int, int]], delay_frames: int = 0) -> bytes:
+    """Watch request asking the bridge to stream these (bus address, length) RAM ranges."""
+    if delay_frames not in (0, 1):
+        raise ValueError("the bridge supports a RAM delay of 0 or 1 frames")
+    out = WATCH_HEADER.pack(WATCH_MAGIC, VERSION, delay_frames, len(ranges))
+    return out + b"".join(WATCH_RANGE.pack(a, n) for a, n in ranges)
+
+
+def read_message(conn: socket.socket) -> tuple[bytes, bytes]:
+    """Block until one complete bridge message arrives; returns (header, payload)."""
+    header = _recv_exact(conn, HEADER.size)
+    payload = _recv_exact(conn, parse_header(header)[3])
+    return header, payload
 
 
 def load_capture(path: str | Path) -> GBAState:
@@ -86,16 +120,25 @@ def _recv_exact(conn: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+# Called with (game code, title) when the bridge connects; returns a watch
+# request (ranges, delay_frames) to send back, or None.
+HelloHandler = Callable[[str, str], "tuple[list[tuple[int, int]], int] | None"]
+
+
 class FrameReceiver:
     """Listens for the mGBA bridge and keeps the latest complete state.
 
     Runs in a background thread. `latest()` returns a copy of the newest state
     (or None if no full snapshot has arrived yet) plus a sequence number that
-    increments with every received frame.
+    increments with every received frame. When the bridge says hello,
+    `on_hello` decides which work-RAM ranges to request.
     """
 
-    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT):
+    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT, on_hello: HelloHandler | None = None):
         self.host, self.port = host, port
+        self.on_hello = on_hello
+        self.game_code: str | None = None
+        self.game_title: str | None = None
         self._lock = threading.Lock()
         self._state = GBAState()
         self._have_full = False
@@ -140,18 +183,30 @@ class FrameReceiver:
                 conn.settimeout(None)
                 self.connected = True
                 with self._lock:
+                    # A new connection starts from scratch (RAM may now belong to another game).
+                    self._state = GBAState()
                     self._have_full = False
                 try:
                     while not self._stop.is_set():
-                        header = _recv_exact(conn, HEADER.size)
-                        _, _, _, payload_len = parse_header(header)
-                        payload = _recv_exact(conn, payload_len)
+                        header, payload = read_message(conn)
+                        if parse_header(header)[0] & FLAG_HELLO:
+                            self._handle_hello(conn, payload)
+                            continue
                         with self._lock:
                             full = apply_message(self._state, header, payload)
                             self._have_full = self._have_full or full
                             self._seq += 1
                         self.frames_received += 1
                 except (ConnectionError, OSError, ProtocolError) as e:
-                    print(f"[shadow] bridge connection closed: {e}")
+                    if self.game_code or self.frames_received:   # stay quiet for bare port probes
+                        print(f"[shadow] bridge connection closed: {e}")
                 finally:
                     self.connected = False
+
+    def _handle_hello(self, conn: socket.socket, payload: bytes) -> None:
+        self.game_code, self.game_title = parse_hello(payload)
+        print(f"[shadow] bridge connected: game code {self.game_code!r}, title {self.game_title!r}")
+        request = self.on_hello(self.game_code, self.game_title) if self.on_hello else None
+        if request:
+            ranges, delay = request
+            conn.sendall(encode_watch(ranges, delay))
