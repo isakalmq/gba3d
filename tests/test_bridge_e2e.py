@@ -70,3 +70,77 @@ def test_stream_reconstructs_state(tmp_path):
         compared += 1
     assert compared >= len(captures) // 2
     assert len(snapshots) > 100
+
+
+def _run_with_adapter_server(delay: int, frames: int = 600) -> tuple[str | None, int, int]:
+    """Run the test ROM with a renderer that answers hello with the adapter's watch list.
+    Returns (game code, frames where entity matches OAM, frames where it does not)."""
+    from shadow.entities import extract_world
+    from shadow.games import find_adapter
+    from shadow.protocol import FLAG_HELLO, encode_watch, parse_hello, read_message
+
+    server = socket.create_server(("127.0.0.1", 0))
+    port = server.getsockname()[1]
+    result = {"code": None, "ok": 0, "bad": 0}
+
+    def serve():
+        conn, _ = server.accept()
+        st, adapter = GBAState(), None
+        with conn:
+            while True:
+                try:
+                    header, payload = read_message(conn)
+                except ConnectionError:
+                    return
+                if parse_header(header)[0] & FLAG_HELLO:
+                    result["code"] = parse_hello(payload)[0]
+                    adapter = find_adapter(result["code"])
+                    conn.sendall(encode_watch(adapter.ram_ranges, delay))
+                    continue
+                apply_message(st, header, payload)
+                world = extract_world(adapter, st)
+                if not world.entities or st.dispcnt & 0x80:
+                    continue
+                e = world.entities[0]
+                oam_x = int(st.oam16[e.oam[0] * 4 + 1]) & 511
+                result["ok" if oam_x == (int(e.screen[0] - e.size[0] / 2) & 511) else "bad"] += 1
+
+    t = threading.Thread(target=serve, daemon=True)
+    t.start()
+    proc = subprocess.run([str(HARNESS), str(ROM), str(BRIDGE), str(frames)],
+                          env=dict(os.environ, SHADOW_PORT=str(port)), capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr
+    t.join(timeout=10)
+    server.close()
+    return result["code"], result["ok"], result["bad"]
+
+
+def test_hello_watch_and_ram_delay():
+    # The test ROM (like Pokemon) runs logic, then uploads OAM in the next VBlank, so RAM read at
+    # VBlank is one frame ahead of the picture. With a one-frame delay they must agree exactly.
+    code, ok, bad = _run_with_adapter_server(delay=1)
+    assert code == "STST"
+    assert ok > 200 and bad == 0
+    _, ok0, bad0 = _run_with_adapter_server(delay=0)
+    assert bad0 > ok0                         # without the delay the entity runs ahead
+
+
+def test_capture_includes_watched_ram(tmp_path):
+    from shadow.entities import extract_world
+    from shadow.games import find_adapter
+
+    env = dict(os.environ, SHADOW_STREAM="0", SHADOW_CAPTURE_DIR=str(tmp_path), SHADOW_CAPTURE_EVERY="50",
+               SHADOW_CAPTURE_COUNT="0", SHADOW_WATCH="0x02000000:12", SHADOW_RAM_DELAY="1")
+    proc = subprocess.run([str(HARNESS), str(ROM), str(BRIDGE), "700"], env=env,
+                          capture_output=True, text=True, timeout=300)
+    assert proc.returncode == 0, proc.stderr
+    checked = 0
+    for cap in sorted(tmp_path.glob("*.gbsh")):
+        st = load_capture(cap)
+        world = extract_world(find_adapter("STST"), st)
+        if not world.entities or st.dispcnt & 0x80:
+            continue
+        e = world.entities[0]
+        assert int(st.oam16[e.oam[0] * 4 + 1]) & 511 == int(e.screen[0] - 16) & 511
+        checked += 1
+    assert checked >= 5
