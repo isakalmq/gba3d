@@ -198,7 +198,8 @@ class FrameReceiver:
                             self._seq += 1
                         self.frames_received += 1
                 except (ConnectionError, OSError, ProtocolError) as e:
-                    print(f"[shadow] bridge connection closed: {e}")
+                    if self.game_code or self.frames_received:   # stay quiet for bare port probes
+                        print(f"[shadow] bridge connection closed: {e}")
                 finally:
                     self.connected = False
 

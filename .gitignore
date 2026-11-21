@@ -8,3 +8,8 @@ build/
 dumps/
 captures/
 shadow_*.png
+player/shadow-play
+roms/*
+!roms/README.md
+*.sav
+*.ss[0-9]

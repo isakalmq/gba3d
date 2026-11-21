@@ -49,22 +49,50 @@ patterns.*
 
 ## Quick start
 
-Requirements: mGBA **0.10 or newer** (needs scripting support), Python 3.10+.
+Requirements: Python 3.10+ and, on Ubuntu/Debian:
+
+```bash
+sudo apt install mgba-qt libmgba-dev libsdl2-dev
+```
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Put your ROM in `roms/` (git ignores everything in there), then:
+
 ```bash
-python -m shadow view
+./start.py
 ```
 
-Then in mGBA, load your ROM and open **Tools → Scripting… → File → Load script**,
-and pick `lua/shadow_bridge.lua`. The view appears within a second. The order doesn't
-matter: the script retries the connection every 60 frames.
+That builds `player/shadow-play` on first use, starts the WebSocket server,
+launches the game with the bridge already loaded, and opens the 3D web client.
+Close the game window to stop everything. Options:
+
+```bash
+./start.py emerald          # pick a ROM by part of its file name, if roms/ has several
+./start.py --view           # pygame viewer instead of the web client
+./start.py --dump dumps/mygame   # viewer + dump new sprites (see below)
+./start.py --pack packs/mygame   # viewer with your replacement graphics
+./start.py --emulator mgba  # use the mGBA app instead of shadow-play
+```
+
+**shadow-play** is a minimal player built on libmgba, the library under mGBA, so
+the emulation is the same. It exists because mGBA 0.10 can't load a Lua script
+from the command line. Controls: arrows, **X** = A, **Z** = B, **A**/**S** =
+L/R, **Enter** = Start, **Backspace** = Select, hold **Tab** to fast-forward,
+**F5**/**F8** to save/load a state, **Esc** to quit. Game controllers work too.
+Battery saves go next to the ROM, as in mGBA, so mGBA can read them as well.
+
+**With the mGBA app** (`--emulator mgba`, or if shadow-play can't be built),
+load the script by hand: **Tools → Scripting… → File → Load script** and pick
+`lua/shadow_bridge.lua`. The order doesn't matter: the script retries the
+connection every 60 frames. To run the pieces separately, start
+`python -m shadow serve` (or `view`) first.
 
 Viewer keys: **B** sprite boxes (green = replaced, yellow = original, blue = OBJ window),
-**R** toggle replacements, **S** screenshot, **Esc** quit.
+**E** entity overlay, **H** hide entity sprites, **R** toggle replacements,
+**S** screenshot, **Esc** quit.
 
 ## Making replacement graphics
 
@@ -264,6 +292,8 @@ but a full HD pack at 60 fps needs the GPU port listed below.
 ## Layout
 
 ```
+start.py                starts renderer + emulator + browser
+roms/                   your ROMs (git-ignored)
 lua/shadow_bridge.lua   mGBA script: state + RAM streaming, capture mode
 shadow/                 Python package (python -m shadow …)
   protocol.py           wire format, TCP receiver (hello/watch), capture loading
@@ -280,6 +310,7 @@ shadow/                 Python package (python -m shadow …)
 tools/make_demo_pack.py demo pack generator
 testrom/                homebrew test ROM (C)
 harness/                headless libmgba runner (C)
+player/                 shadow-play: libmgba + SDL2 player that loads the bridge at startup (C)
 tests/                  pytest suite + mGBA capture fixtures
 ```
 

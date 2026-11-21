@@ -9,6 +9,10 @@ rom:
 harness:
 	$(MAKE) -C harness
 
+# Optional: the libmgba + SDL2 player that ./start.py launches (needs libsdl2-dev).
+player:
+	$(MAKE) -C player
+
 # Capture ~120 frames of the test ROM headlessly, then compare the renderer against mGBA.
 selftest: all
 	rm -rf $(CAPTURES) && mkdir -p $(CAPTURES)
@@ -22,6 +26,7 @@ test:
 clean:
 	$(MAKE) -C testrom clean
 	$(MAKE) -C harness clean
+	$(MAKE) -C player clean
 	rm -rf build
 
-.PHONY: all rom harness selftest test clean
+.PHONY: all rom harness player selftest test clean
