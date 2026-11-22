@@ -37,9 +37,16 @@ Builds a realistic game state for any map from the pret/pokeemerald decompilatio
 python3 tools/emerald_fixture.py LittlerootTown_BrendansHouse_1F --player 5,4 -o build/mom1f.png
 ```
 
-It writes the original 2D picture (3x) and prints how many pixels the 3D diorama differs
-from it when seen from the game's view. **This must be 0**; anything else is a bug in
-`tilemap.py` or the adapter. Layout names are the folder names in the decomp's
+It writes the original 2D picture (3x) and prints how many pixels the automatic 3D diorama
+(without props) differs from it when seen from the game's view. **This must be 0**;
+anything else is a bug in `tilemap.py` or the adapter. Props deliberately replace the
+original art, so check them with screenshots instead.
+
+The fake ROM puts the map's Tileset structs at their **real addresses**, taken from the
+decomp's symbol map (`symbols` branch, fetched into `build/decomp/pokeemerald-symbols`).
+That's because the prop kit (`PROP_KIT` in `shadow/games/pokeemerald.py`) identifies
+tilesets by ROM address. If props don't show up in a fixture screenshot, check that
+first. Layout names are the folder names in the decomp's
 `data/layouts/` (e.g. `LittlerootTown_BrendansHouse_2F`, `LittlerootTown`).
 
 The decomp is sparse-cloned on demand into `build/decomp/pokeemerald` (only the files a
@@ -116,9 +123,15 @@ instead, because browser chrome shifts the viewport.
 3. Check the fit with `tools/screenshot.py <map> --facing N` for all four facings,
    in both `--view 3d` and `--view 2d`. Add `--orbit` shots to see the model from
    the side.
-4. For maps: the 3D diorama must stay pixel-exact in the game's view (fixture tool
-   prints the count). Turned views show the automatic blocks; props replacing
-   metatiles should line up with them.
+4. Props (furniture replacing metatiles):
+   - Add a `PropDef` to `PROP_KIT` (tileset address + metatile id pattern + anchor +
+     facing); see `shadow/props.py` and the README's prop kit section.
+   - `tools/model_props.py` / `make props-blend` build the prop .blend files from
+     code; `make models` exports them.
+   - Check with a fixture screenshot of a map that uses them, in the game's view
+     (should cover about the same pixels as the original art) and with `--orbit`.
+5. For maps: the automatic diorama must stay pixel-exact in the game's view (the
+   fixture tool prints the count).
 
 ## Cloud sandbox notes
 

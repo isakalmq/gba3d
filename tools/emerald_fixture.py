@@ -32,6 +32,7 @@ from shadow.state import GBAState                   # noqa: E402
 from test_entities import emerald_state, poke       # noqa: E402
 
 DECOMP = REPO / "build" / "decomp" / "pokeemerald"
+DECOMP_SYMBOLS = REPO / "build" / "decomp" / "pokeemerald-symbols"
 DECOMP_URL = "https://github.com/pret/pokeemerald"
 
 
@@ -48,6 +49,22 @@ def ensure_decomp(paths: list[str]) -> Path:
         subprocess.run(["git", "-C", str(DECOMP), "sparse-checkout", "add", *[f"/{p}" for p in missing]],
                        check=True, capture_output=True)
     return DECOMP
+
+
+def symbol_address(name: str) -> int | None:
+    """Address of a symbol in the real ROM/RAM (pokeemerald.sym from the decomp's
+    `symbols` branch, fetched once). Used so fixture structures sit where the real
+    game has them, e.g. tilesets, which the prop kit identifies by address."""
+    sym = DECOMP_SYMBOLS / "pokeemerald.sym"
+    if not sym.exists():
+        DECOMP_SYMBOLS.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["git", "clone", "-q", "--depth", "1", "-b", "symbols", DECOMP_URL, str(DECOMP_SYMBOLS)],
+                       check=True)
+    for line in sym.read_text().splitlines():
+        parts = line.split()
+        if len(parts) >= 4 and parts[3] == name:
+            return int(parts[0], 16)
+    return None
 
 
 def layout_info(name: str) -> dict:
@@ -105,8 +122,9 @@ def build(layout: str, player_tile=(5, 4), facing: int = 1) -> tuple[GBAState, R
     blockdata = (DECOMP / info["blockdata_filepath"]).read_bytes()
     border = (DECOMP / info["border_filepath"]).read_bytes()
 
-    # Fake ROM: layout, tilesets, metatile tables, at fixed offsets.
-    rom = bytearray(0x200000)
+    # Fake ROM: layout and metatile tables at fixed offsets; the Tileset structs at their
+    # real addresses when the symbol map has them (the prop kit matches tilesets by address).
+    rom = bytearray(0x800000)
     rom[0xAC:0xB0] = b"BPEE"
 
     def put(off, data):
@@ -117,8 +135,10 @@ def build(layout: str, player_tile=(5, 4), facing: int = 1) -> tuple[GBAState, R
     s_meta = put(0x120000, (secondary / "metatiles.bin").read_bytes())
     s_attr = put(0x128000, (secondary / "metatile_attributes.bin").read_bytes())
     b_ptr, m_ptr = put(0x130000, border), put(0x131000, blockdata)
-    prim = put(0x100100, struct.pack("<BBxxIIIII", 0, 0, 0, 0, p_meta, p_attr, 0))
-    sec = put(0x100200, struct.pack("<BBxxIIIII", 0, 1, 0, 0, s_meta, s_attr, 0))
+    p_addr = symbol_address(info["primary_tileset"]) or 0x08100100
+    s_addr = symbol_address(info["secondary_tileset"]) or 0x08100200
+    prim = put(p_addr - 0x08000000, struct.pack("<BBxxIIIII", 0, 0, 0, 0, p_meta, p_attr, 0))
+    sec = put(s_addr - 0x08000000, struct.pack("<BBxxIIIII", 0, 1, 0, 0, s_meta, s_attr, 0))
     layout_ptr = put(0x100000, struct.pack("<iiIIII", w, h, b_ptr, m_ptr, prim, sec))
     rom = Rom(bytes(rom))
 
