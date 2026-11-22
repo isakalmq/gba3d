@@ -41,12 +41,16 @@ patterns.*
   replacement toggle and screenshots.
 - **Entities** (`shadow/games/`): per-game adapters read the game's own objects
   from work RAM and turn them into entities (position, tile, facing, moving, and
-  the sprite slots that draw them). Included: **Pokémon Emerald (US), player
-  only**, and the test ROM.
+  the sprite slots that draw them). Included: **Pokémon Emerald (US): the
+  player and NPCs, plus the map for 3D**, and the test ROM.
 - **WebSocket output + 3D demo** (`python -m shadow serve`): publishes every
   frame plus its entities, split into layers behind and in front of the player
   plus UI. A three.js page shows the game from its original point of view, with
-  a cube in place of each entity's sprite, drawn in the game's own layer order.
+  a model (or a cube) in place of each entity's sprite, drawn in the game's own layer order.
+- **3D maps** (Pokémon Emerald, with its ROM in `roms/`): the map itself becomes
+  3D geometry, built from the game's own metatile grid and textured from live
+  VRAM. From the game's point of view it matches the original picture pixel for
+  pixel; drag the picture to turn the room and see it's real 3D.
 
 ## Quick start
 
@@ -240,6 +244,58 @@ at bus addresses: reading anything not in `ram_ranges` raises, so missing
 ranges show up immediately. Then register it in `shadow/games/__init__.py`.
 `shadow/games/shadowtest.py` is the smallest example.
 
+## 3D maps
+
+![Mom's house built from the game's own data: left, the game's view (identical to the original picture); right, the same scene turned](docs/3d-map.png)
+
+The web client's **3D map** view (the default) replaces the background picture
+with geometry. It's available when the adapter can read the map: for Pokémon
+Emerald, `./start.py` passes your ROM file to the server (`serve --rom ...`), or
+the server finds it in `roms/` by game code. Otherwise the client falls back to
+the 2D picture view. Drag the picture to turn the scene; it springs back to the
+game's view when you let go.
+
+**Where the data comes from.** Emerald keeps the current map in RAM as a grid of
+16x16 *metatiles*, each with a metatile id, a collision flag and an elevation
+(`gBackupMapLayout`, streamed by the bridge, including the 7-cell border). The
+metatile definitions (which 8x8 tiles, which palette, which layer) and
+attributes come from the tilesets `gMapHeader` points to, read from the ROM file.
+The pixels come from live VRAM and palette RAM, so animated tiles and palette
+fades show up. When the game changes a metatile (a door opening), the map is
+rebuilt.
+
+**How the geometry is built** (`shadow/tilemap.py`):
+
+- **Camera:** the game's own *oblique* projection: the floor maps 1:1 to the
+  screen and anything with height moves straight up by its height
+  (`screen y = z - y`, in GBA pixels). The client uses exactly that projection,
+  so the geometry lines up with the original art and the models stand in the
+  same world.
+- **Floor:** walkable cells become floor tiles with their art.
+- **Walls and furniture:** impassable cells (except water, ledges and the border)
+  become blocks. A run of up to 4 such cells going north is one block standing
+  on the southern cell: its front face carries the run's art and its top the
+  top half of the northmost cell. That covers exactly the same screen area the
+  cells did, so the picture is unchanged, but the blocks now have depth and
+  hide models standing behind them.
+- **Parts drawn over characters** (bed covers and similar, the game's top BG
+  layer): upright cards on the cell's south edge, so a model standing in the
+  cell is behind them.
+- **Turned views only:** block sides and the floor under blocks.
+
+`tilemap.rasterize()` is a reference software renderer for this projection.
+The tests check that the diorama, seen through it, is identical to the cells'
+art laid out flat. A Mom's-house fixture built from the decompilation's
+assets matched the original picture with 0 differing pixels.
+
+**Limits of the automatic version.** It only knows "walkable" and "impassable",
+not what an object is. So furniture becomes simple blocks whose height comes from
+how many cells it spans: Mom's 2x2 table is a tall box. The planned prop kit
+fixes that by swapping metatiles for real models, keyed by (tileset, metatile
+id). Outdoor maps work the same way, but elevation (cliffs) and map connections
+aren't used yet. Sprites that aren't entities (effects, items) are drawn as a
+flat layer on top of the 3D scene.
+
 ## Checking the renderer against mGBA
 
 The bridge can also save full snapshots plus mGBA's own screenshot of the same
@@ -321,6 +377,9 @@ but a full HD pack at 60 fps needs the GPU port listed below.
   cover the model fully instead of blending. Screen fades done through
   palettes (most of Emerald's) darken the picture but not the models. The
   server would need to pass the fade level along for that.
+- **3D map prop kit.** Real 3D props per (tileset, metatile id) instead of
+  automatic blocks, a map exporter for modelling rooms in Blender, elevation
+  for outdoor cliffs, and stitching connected maps.
 - **More entities.** The Emerald adapter covers the player and NPCs, but only
   the mom has a kind (and a model) of her own. Next: more kinds, and a RAM
   inspector tool for games without a decompilation.
@@ -342,6 +401,8 @@ shadow/                 Python package (python -m shadow …)
   render.py             reference renderer + replacement compositing
   pack.py               hashing, replacement packs, dumper
   entities.py           Entity / World model, adapter interface
+  tilemap.py            tile map -> 3D diorama, texture atlas, reference rasterizer
+  rom.py                ROM file access (finds ROMs in roms/ by game code)
   games/                game adapters (pokeemerald.py, shadowtest.py)
   session.py            bridge connection + adapter selection
   server.py             WebSocket server (python -m shadow serve)

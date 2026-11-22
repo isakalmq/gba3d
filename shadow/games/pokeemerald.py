@@ -13,6 +13,10 @@ What is read:
   gSpriteCoordOffsetX/Y   camera offset applied to field sprites (-> screen position)
   gSaveBlock1Ptr->pos     camera tile, gFieldCamera.x/y sub-tile camera offset,
   gTotalCameraPixelOffset accumulated camera scroll (-> world position)
+  gBackupMapLayout        the live map grid (sBackupMapData): metatile id, collision,
+                          elevation per 16x16 cell, including a 7-cell border
+  gMapHeader.mapLayout    (ROM) -> tilesets -> metatile definitions and attributes,
+                          read from the ROM file in roms/ (see tilemap())
 
 Timing: Emerald runs its logic, builds a RAM copy of OAM, and uploads it in the
 next VBlank (VBlankCB_Overworld -> LoadOam), so RAM read at VBlank is one frame
@@ -20,8 +24,13 @@ ahead of the picture: ram_delay = 1.
 """
 from __future__ import annotations
 
+import hashlib
+
+import numpy as np
+
 from ..entities import FACING_NAMES, Entity, oam_size, oam_slots_for_tiles
-from ..state import GBAState
+from ..state import GBAState, MemoryNotWatched
+from ..tilemap import Metatile, TileMap
 
 G_MAIN = 0x030022C0                # struct Main; callback2 at +4
 CB2_OVERWORLD = 0x08085E5C
@@ -39,6 +48,16 @@ G_FIELD_CAMERA = 0x03005DD0        # struct CameraObject; x at +0x10, y at +0x14
 G_TOTAL_CAMERA_PIXEL_OFFSET_Y = 0x03005DE8
 G_TOTAL_CAMERA_PIXEL_OFFSET_X = 0x03005DEC
 MAP_OFFSET = 7                     # object event coords include a 7-tile border
+G_MAP_HEADER = 0x02037318          # struct MapHeader; mapLayout (ROM pointer) at +0
+G_BACKUP_MAP_LAYOUT = 0x03005DC0   # struct BackupMapLayout { s32 width, height; u16 *map }
+S_BACKUP_MAP_DATA = 0x02032318     # u16[MAX_MAP_DATA_SIZE = 10240]
+BACKUP_MAP_DATA_SIZE = 0x5000
+NUM_METATILES_IN_PRIMARY = 512
+# Metatile layer types (include/global.fieldmap.h, DrawMetatile in src/field_camera.c):
+# which BG each half of a metatile goes to. BG1 is drawn above characters, BG2/BG3 below.
+LAYER_NORMAL, LAYER_COVERED, LAYER_SPLIT = 0, 1, 2
+# Impassable but flat: water (MB_POND_WATER..MB_SHALLOW_WATER) and ledges (MB_JUMP_*).
+FLAT_BEHAVIORS = frozenset(range(0x10, 0x18)) | frozenset(range(0x38, 0x40))
 
 # Graphics ids with a kind of their own (include/constants/event_objects.h); other
 # characters are kind "npc" and carry their graphics id in props.
@@ -61,12 +80,72 @@ class PokemonEmeraldAdapter:
         (G_SAVEBLOCK1, 0x88),
         (G_OBJECT_EVENTS, G_PLAYER_AVATAR + 0x24 - G_OBJECT_EVENTS),   # object events + avatar
         (G_MAIN, 8),
-        (G_SAVEBLOCK1_PTR, G_TOTAL_CAMERA_PIXEL_OFFSET_X + 2 - G_SAVEBLOCK1_PTR),
+        (G_SAVEBLOCK1_PTR, G_TOTAL_CAMERA_PIXEL_OFFSET_X + 2 - G_SAVEBLOCK1_PTR),   # incl. gBackupMapLayout
+        (G_MAP_HEADER, 0x1C),
+        (S_BACKUP_MAP_DATA, BACKUP_MAP_DATA_SIZE),
     ]
     ram_delay = 1
     # Overworld BGs (sOverworldBgTemplates): BG0 = text boxes / menus (priority 0),
     # BG1 = map top layer (1), BG2/BG3 = map middle/bottom layers (2/3).
     hud_bgs = frozenset({0})
+
+    def __init__(self):
+        self._tileset_cache: dict = {}
+
+    # -- map ---------------------------------------------------------------------------
+    def tilemap(self, st: GBAState, rom) -> TileMap | None:
+        """The current map as metatile cells (None outside the overworld or without the ROM)."""
+        if rom is None or (st.u32(G_MAIN + 4) & ~1) != CB2_OVERWORLD:
+            return None
+        width, height = st.s32(G_BACKUP_MAP_LAYOUT), st.s32(G_BACKUP_MAP_LAYOUT + 4)
+        ptr = st.u32(G_BACKUP_MAP_LAYOUT + 8)
+        if width <= 0 or height <= 0 or width * height * 2 > BACKUP_MAP_DATA_SIZE:
+            return None
+        try:
+            grid = np.frombuffer(st.ram(ptr, width * height * 2).tobytes(), "<u2").reshape(height, width)
+        except MemoryNotWatched:
+            return None
+        layout = st.u32(G_MAP_HEADER)
+        try:
+            primary, secondary = rom.u32(layout + 0x10), rom.u32(layout + 0x14)
+            # Cells nothing was loaded into are MAPGRID_UNDEFINED; the game shows the
+            # layout's 2x2 border pattern there instead, impassable (GetBorderBlockAt).
+            undefined = (grid & 0x3FF) == 0x3FF
+            if undefined.any():   # (kept as a mask below)
+                border = np.array(rom.u16_array(rom.u32(layout + 0x08), 4), np.uint16) | 0x0C00
+                ys, xs = np.mgrid[0:height, 0:width]
+                grid = np.where(undefined, border[((xs + 1) & 1) + (((ys + 1) & 1) << 1)], grid)
+            ids = grid & 0x3FF
+            metatiles, flat = {}, set()
+            for mid in np.unique(ids).tolist():
+                mt, behavior = self._metatile(rom, primary, secondary, mid)
+                if mt is not None:
+                    metatiles[mid] = mt
+                    if behavior in FLAT_BEHAVIORS:
+                        flat.add(mid)
+        except ValueError:
+            return None                                # not this game's ROM, or a bad pointer
+        collision = (grid >> 10) & 3
+        # The border around the map is scenery past the edge, not walls: keep it flat.
+        raised = (collision != 0) & ~np.isin(ids, list(flat)) & ~undefined
+        key = (layout, width, height, hashlib.blake2b(grid.tobytes(), digest_size=8).hexdigest())
+        origin = (-MAP_OFFSET * 16, -MAP_OFFSET * 16)  # cell (0, 0) is map tile (-7, -7)
+        return TileMap(key, ids.astype(np.uint16), raised, origin, metatiles, name=f"layout {layout:08X}")
+
+    def _metatile(self, rom, primary: int, secondary: int, mid: int):
+        cache_key = (primary, secondary, mid)
+        if cache_key not in self._tileset_cache:
+            tileset, i = (primary, mid) if mid < NUM_METATILES_IN_PRIMARY else (secondary, mid - NUM_METATILES_IN_PRIMARY)
+            table, attrs = rom.u32(tileset + 0x0C), rom.u32(tileset + 0x10)
+            e = rom.u16_array(table + i * 16, 8)
+            attr = rom.u16(attrs + i * 2)
+            layer = attr >> 12
+            if layer == LAYER_COVERED:                   # both halves below characters
+                mt = Metatile(under=e[:4], over=None, under_extra=e[4:])
+            else:                                        # NORMAL / SPLIT: top half on BG1
+                mt = Metatile(under=e[:4], over=e[4:])
+            self._tileset_cache[cache_key] = (mt, attr & 0xFF)
+        return self._tileset_cache[cache_key]
 
     def extract(self, st: GBAState):
         """The player first (renderers layer relative to the first entity), then the

@@ -16,6 +16,7 @@
   #status.ok { color: #7bd88f; }
   label { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
   input[type=range] { flex: 1; }
+  fieldset { border: 0; padding: 0; margin: 3px 0; display: flex; gap: 12px; }
   pre { margin: 6px 0 0; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
     white-space: pre-wrap; color: var(--muted); max-height: 35vh; overflow: auto; }
 </style>
@@ -30,11 +31,15 @@
 <details open>
   <summary>gba-shadow 3D</summary>
   <div id="status">connecting…</div>
+  <fieldset>
+    <label><input type="radio" name="view" value="3d" checked> 3D map</label>
+    <label><input type="radio" name="view" value="2d"> 2D picture</label>
+  </fieldset>
   <label><input id="models" type="checkbox" checked> 3D models</label>
   <label><input id="hide" type="checkbox" checked> hide original entity sprites</label>
-  <label><input id="front" type="checkbox" checked> layers in front of models</label>
+  <label><input id="front" type="checkbox" checked> layers in front of models (2D)</label>
   <label><input id="hud" type="checkbox" checked> UI layer (text boxes, menus)</label>
-  <label>model view angle <input id="angle" type="range" min="15" max="85" value="40"></label>
+  <label>model view angle (2D) <input id="angle" type="range" min="15" max="85" value="40"></label>
   <pre id="info"></pre>
 </details>
 <script type="module">
@@ -42,11 +47,18 @@ import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
 
-// The game picture stays exactly as on the GBA (240x160, letterboxed to the
-// window). Models are drawn by a separate orthographic camera that looks down
-// at a 3/4 angle like the game's art, at the same scale (1 unit = 1 GBA pixel),
-// and are placed so their feet land on the entity's screen position. Draw order:
-// behind -> models -> front -> hud, which is the game's own layer order.
+// Two views:
+//
+// 3D map: the server sends the current map as geometry (a "diorama" built from the
+// game's own metatile grid, textured from live VRAM). It is drawn with the game's
+// own oblique projection - screen x = x, screen y = z - y, in GBA pixels - so it
+// lines up exactly with the original picture, while depth, occlusion and shading
+// are real 3D. Models stand in the same world. Remaining sprites and the UI layer
+// are drawn on top as flat layers.
+//
+// 2D picture: the game picture stays exactly as on the GBA; models are drawn by a
+// separate 3/4-angle camera and placed over the sprites they replace, in the game's
+// layer order: behind -> models -> front -> hud.
 const W = 240, H = 160;
 const $ = (id) => document.getElementById(id);
 
@@ -79,10 +91,12 @@ const overlayScene = new THREE.Scene();
 const layers = {
   behind: makeLayer(backScene, 0),
   front: makeLayer(overlayScene, 1),
-  hud: makeLayer(overlayScene, 2),
+  sprites: makeLayer(overlayScene, 2),
+  hud: makeLayer(overlayScene, 3),
 };
 
-// --- models ----------------------------------------------------------------------
+// --- cameras -------------------------------------------------------------------
+// 2D view: models seen by a tilted orthographic camera, positioned in screen pixels.
 const modelScene = new THREE.Scene();
 const modelCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -4000, 4000);
 modelScene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.4));
@@ -100,20 +114,77 @@ function setAngle(deg) {
 setAngle(Number($("angle").value));
 $("angle").oninput = (e) => setAngle(Number(e.target.value));
 
-// Ground point under a screen position: x maps 1:1, screen y is foreshortened
-// depth (z) as seen by the tilted camera.
+// 3D view: the game's oblique projection. World units are map pixels (x east,
+// z south, y up). The camera looks along -(0,1,1) so lighting has a sensible view
+// direction; the projection matrix maps world -> clip directly:
+//   clip.x = 2(x - ox)/W - 1,  clip.y = 1 - 2(z - y - oy)/H,  depth from y + z.
+const worldScene = new THREE.Scene();
+const worldCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
+worldCam.lookAt(0, -1, -1);
+worldCam.updateMatrixWorld();
+const DEPTH_MIN = -4000, DEPTH_RANGE = 16000;
+let origin = [0, 0];                       // world pixel at the screen's top-left (adapter's camera)
+// Optional orbit (drag on the picture): the world turns around the ground point under
+// the screen centre; it eases back to the game's exact view when released.
+const orbit = { yaw: 0, pitch: 0, dragging: false };
+const _rot = new THREE.Matrix4(), _tmpM = new THREE.Matrix4();
+function setWorldCamera(ox, oy) {
+  const C = new THREE.Matrix4().set(
+    2 / W, 0, 0, -1 - 2 * ox / W,
+    0, 2 / H, -2 / H, 1 + 2 * oy / H,
+    0, -2 / DEPTH_RANGE, -2 / DEPTH_RANGE, 1 + 2 * DEPTH_MIN / DEPTH_RANGE,
+    0, 0, 0, 1);
+  if (orbit.yaw || orbit.pitch) {
+    const px = ox + W / 2, pz = oy + H / 2;
+    _rot.makeTranslation(px, 0, pz)
+      .multiply(_tmpM.makeRotationX(orbit.pitch))
+      .multiply(_tmpM.makeRotationY(orbit.yaw))
+      .multiply(_tmpM.makeTranslation(-px, 0, -pz));
+    C.multiply(_rot);
+  }
+  worldCam.projectionMatrix.multiplyMatrices(C, worldCam.matrixWorld);
+  worldCam.projectionMatrixInverse.copy(worldCam.projectionMatrix).invert();
+}
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  orbit.dragging = true;
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener("pointermove", (e) => {
+  if (!orbit.dragging) return;
+  orbit.yaw = THREE.MathUtils.clamp(orbit.yaw + e.movementX * 0.006, -0.9, 0.9);
+  orbit.pitch = THREE.MathUtils.clamp(orbit.pitch + e.movementY * 0.004, -0.5, 0.35);
+});
+renderer.domElement.addEventListener("pointerup", () => { orbit.dragging = false; });
+
+let view = "2d";                           // the view the latest frame was made for
+const in3d = () => view === "3d";
+
+// Ground point under a screen position, in the current view's model space.
 function groundFromScreen(sx, sy, out) {
+  if (in3d()) return out.set(sx + origin[0], 0, sy + origin[1]);
   return out.set(sx - W / 2, 0, (sy - H / 2) / Math.sin(THREE.MathUtils.degToRad(angle)));
+}
+
+// How far "up the screen" a model-space point (height y, depth z after rotation)
+// appears: the tilted camera foreshortens both, the oblique projection doesn't.
+function screenUp(y, z) {
+  if (in3d()) return y - z;
+  const t = THREE.MathUtils.degToRad(angle);
+  return y * Math.cos(t) - z * Math.sin(t);
 }
 
 // Fit a box model over the screen rectangle the game drew the character in
 // ("drawn": x0, y0, x1, y1). In the game's 3/4 view the bottom of the art is the
 // front of the character's footprint and the top of the art is the top of its
-// head, so: width = art width, front edge on the bottom line, and a height that
-// makes the projected top reach the top of the art.
+// head: width = art width, front edge on the bottom line, and a height that makes
+// the projected top reach the top of the art.
 function fitBox([x0, y0, x1, y1]) {
-  const t = THREE.MathUtils.degToRad(angle), sin = Math.sin(t), cos = Math.cos(t);
   const w = Math.max(4, x1 - x0), tall = Math.max(4, y1 - y0);
+  if (in3d()) {
+    const d = tall - w < 4 ? Math.max(2, tall - 4) : w;
+    return { w, d, h: Math.max(4, tall - d), cx: (x0 + x1) / 2, bottom: y1 };
+  }
+  const t = THREE.MathUtils.degToRad(angle), sin = Math.sin(t), cos = Math.cos(t);
   let d = w;                                      // square footprint (turns in place)
   if (tall - d * sin < 4 * cos) d = Math.max(2, (tall - 4 * cos) / sin);
   const h = Math.max(4, (tall - d * sin) / cos);
@@ -121,17 +192,16 @@ function fitBox([x0, y0, x1, y1]) {
 }
 
 // Fit a real model (uniform scale) over the drawn art: measure its silhouette as
-// the tilted camera sees it at the current yaw, scale it so the silhouette is as
+// the current camera sees it at the current yaw, scale it so the silhouette is as
 // tall as the art, and place it so its lowest point sits on the art's bottom line
-// and it is centered horizontally. Screen "up" of a point is y*cos - z*sin.
+// and it is centered horizontally.
 function fitModel(points, yaw, [x0, y0, x1, y1]) {
-  const t = THREE.MathUtils.degToRad(angle), ct = Math.cos(t), st = Math.sin(t);
   const cy = Math.cos(yaw), sy = Math.sin(yaw);
   let pmin = Infinity, pmax = -Infinity, xmin = Infinity, xmax = -Infinity;
   for (let i = 0; i < points.length; i += 3) {
     const x = points[i], y = points[i + 1], z = points[i + 2];
     const rx = x * cy + z * sy, rz = -x * sy + z * cy;     // rotation.y = yaw
-    const p = y * ct - rz * st;
+    const p = screenUp(y, rz);
     if (p < pmin) pmin = p;
     if (p > pmax) pmax = p;
     if (rx < xmin) xmin = rx;
@@ -250,21 +320,86 @@ function updateActors(entities) {
   for (const [id, a] of actors) if (!seen.has(id)) { modelScene.remove(a); actors.delete(id); }
 }
 
+// --- 3D map ----------------------------------------------------------------------
+// The map arrives as quads (4 corners each) with atlas UVs. Floors and the top-layer
+// cards keep the art's exact colours; wall/furniture faces get slight shading.
+const KIND_SHADE = [1.0, 0.86, 1.0, 1.0, 0.68];       // floor, face, top, card, side
+let mapMesh = null, mapTex = null, mapInfo = null;
+const mapMaterial = new THREE.MeshBasicMaterial({ vertexColors: true, alphaTest: 0.5, side: THREE.DoubleSide });
+
+function setAtlas(atlas, shape) {
+  const [h, w] = shape;
+  if (!mapTex || mapTex.image.width !== w || mapTex.image.height !== h) {
+    mapTex?.dispose();
+    mapTex = new THREE.DataTexture(new Uint8Array(w * h * 4), w, h, THREE.RGBAFormat);
+    mapTex.magFilter = mapTex.minFilter = THREE.NearestFilter;
+    mapTex.colorSpace = THREE.SRGBColorSpace;
+    mapMaterial.map = mapTex;
+    mapMaterial.needsUpdate = true;
+  }
+  mapTex.image.data.set(atlas);
+  mapTex.needsUpdate = true;
+}
+
+function setMap(meta, s) {
+  if (mapMesh) { worldScene.remove(mapMesh); mapMesh.geometry.dispose(); mapMesh = null; }
+  mapInfo = meta.key ? meta : null;
+  if (!meta.key) return;
+  setAtlas(s.atlas.data, s.atlas.shape);
+  const n = meta.quads;
+  const colors = new Float32Array(n * 4 * 3);
+  for (let q = 0; q < n; q++) {
+    const shade = KIND_SHADE[s.kinds.data[q]] ?? 1;
+    for (let v = 0; v < 4; v++) colors.set([shade, shade, shade], (q * 4 + v) * 3);
+  }
+  const index = new Uint32Array(n * 6);
+  for (let q = 0; q < n; q++) index.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4, q * 4 + 2, q * 4 + 3], q * 6);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(s.positions.data, 3));
+  geo.setAttribute("uv", new THREE.BufferAttribute(s.uvs.data, 2));
+  geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geo.setIndex(new THREE.BufferAttribute(index, 1));
+  mapMesh = new THREE.Mesh(geo, mapMaterial);
+  mapMesh.frustumCulled = false;
+  worldScene.add(mapMesh);
+}
+
 // --- networking ----------------------------------------------------------------------
+const DTYPES = { uint8: Uint8Array, float32: Float32Array, uint16: Uint16Array, int32: Int32Array };
+function parseBlob(buf, meta, pos) {
+  const view = new DataView(buf), out = {};
+  for (const sec of meta.sections ?? []) {
+    const size = view.getUint32(pos, true);
+    pos += 4;
+    const T = DTYPES[sec.dtype];
+    out[sec.name] = { data: new T(buf.slice(pos, pos + size)), shape: sec.shape };
+    pos += size;
+  }
+  return out;
+}
+
 let ws, frames = 0, lastMeta = null;
-const sendSettings = () => ws?.readyState === 1 && ws.send(JSON.stringify({ hide_entity_sprites: $("hide").checked }));
+const chosenView = () => document.querySelector("input[name=view]:checked").value;
+const sendSettings = () => ws?.readyState === 1 &&
+  ws.send(JSON.stringify({ hide_entity_sprites: $("hide").checked, view: chosenView() }));
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
   ws.binaryType = "arraybuffer";
   ws.onopen = sendSettings;
   ws.onmessage = (ev) => {
-    const view = new DataView(ev.data);
-    const n = view.getUint32(0, true);
+    const view_ = new DataView(ev.data);
+    const n = view_.getUint32(0, true);
     const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+    if (meta.type === "map") { setMap(meta, parseBlob(ev.data, meta, 4 + n)); return; }
+    if (meta.type === "atlas") {
+      const s = parseBlob(ev.data, meta, 4 + n);
+      if (mapInfo && meta.key === mapInfo.key) setAtlas(s.atlas.data, s.atlas.shape);
+      return;
+    }
     let pos = 4 + n;
     for (const name of Object.keys(layers)) layers[name].mesh.visible = false;
     for (const name of meta.layers) {
-      const size = view.getUint32(pos, true);
+      const size = view_.getUint32(pos, true);
       pos += 4;
       const layer = layers[name];
       if (layer && size) {
@@ -274,6 +409,8 @@ function connect() {
       }
       pos += size;
     }
+    view = meta.view === "3d" && mapMesh ? "3d" : "2d";
+    if (meta.camera?.origin) origin = meta.camera.origin;
     updateActors(meta.entities);
     lastMeta = window.lastMeta = meta;
     frames++;
@@ -282,12 +419,14 @@ function connect() {
 }
 connect();
 $("hide").onchange = sendSettings;
+for (const el of document.querySelectorAll("input[name=view]")) el.onchange = sendSettings;
 
 setInterval(() => {
   if (!lastMeta) { $("status").textContent = "connected - waiting for frames from mGBA…"; return; }
   $("status").className = "ok";
   const shown = Object.entries(layers).filter(([, l]) => l.mesh.visible).map(([k]) => k).join(" + ");
-  $("status").textContent = `${lastMeta.game ?? "?"} · frame ${lastMeta.frame} · ${frames} fps · ${shown}`;
+  const where = in3d() ? `3D map (${mapInfo?.shape?.join("x")} cells)` : "2D picture";
+  $("status").textContent = `${lastMeta.game ?? "?"} · frame ${lastMeta.frame} · ${frames} fps · ${where} · ${shown}`;
   frames = 0;
   const p = lastMeta.entities[0];
   $("info").textContent = p
@@ -302,12 +441,17 @@ resize();
 
 // For tests and debugging: window.gbaShadow.picture = false hides the game picture,
 // window.gbaShadow.updateActors([...]) places models without a game running.
-const debug = window.gbaShadow = { picture: true, updateActors };
+const debug = window.gbaShadow = { picture: true, updateActors, orbit, get view() { return view; } };
 
 const clock = new THREE.Clock();
 const tmp = new THREE.Vector3();
 renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
+  if (!orbit.dragging && !orbit.hold) {               // ease back to the game's view
+    const k = Math.exp(-dt * 5);
+    orbit.yaw = Math.abs(orbit.yaw * k) < 1e-4 ? 0 : orbit.yaw * k;
+    orbit.pitch = Math.abs(orbit.pitch * k) < 1e-4 ? 0 : orbit.pitch * k;
+  }
   for (const a of actors.values()) {
     const d = a.userData;
     d.shown ??= [0, 0, 0, 0];
@@ -363,13 +507,21 @@ renderer.setAnimationLoop(() => {
   renderer.setScissor(vx, vy, vw, vh);
   renderer.setScissorTest(true);
 
-  layers.behind.mesh.visible &&= debug.picture;
-  layers.front.mesh.visible &&= $("front").checked;
+  layers.behind.mesh.visible &&= debug.picture && !in3d();
+  layers.front.mesh.visible &&= $("front").checked && !in3d();
+  layers.sprites.mesh.visible &&= in3d();
   layers.hud.mesh.visible &&= $("hud").checked;
-  renderer.render(backScene, screenCam);
-  if ($("models").checked) {
-    renderer.clearDepth();
-    renderer.render(modelScene, modelCam);
+  if (in3d()) {
+    // Map and models share one depth buffer, so walls and furniture hide models properly.
+    setWorldCamera(origin[0], origin[1]);
+    if (debug.picture) renderer.render(worldScene, worldCam);
+    if ($("models").checked) renderer.render(modelScene, worldCam);
+  } else {
+    renderer.render(backScene, screenCam);
+    if ($("models").checked) {
+      renderer.clearDepth();
+      renderer.render(modelScene, modelCam);
+    }
   }
   renderer.render(overlayScene, screenCam);
 });

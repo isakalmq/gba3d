@@ -124,7 +124,8 @@ def main() -> int:
         if args.dump:
             cmd += ["--dump", str(Path(args.dump).resolve())]
     else:
-        cmd = [sys.executable, "-m", "shadow", "serve", "--port", str(args.port), "--http-port", str(args.http_port)]
+        cmd = [sys.executable, "-m", "shadow", "serve", "--port", str(args.port), "--http-port", str(args.http_port),
+               "--rom", str(rom)]
     renderer = subprocess.Popen(cmd, cwd=REPO)
     emulator = None
     try:

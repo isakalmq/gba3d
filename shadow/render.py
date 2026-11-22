@@ -153,6 +153,7 @@ class SplitResult:
     front: np.ndarray | None = None     # (H, W, 4) RGBA
     hud: np.ndarray | None = None       # (H, W, 4) RGBA
     bounds: dict = field(default_factory=dict)   # name -> (x0, y0, x1, y1) of drawn sprite pixels
+    sprites: np.ndarray | None = None   # (H, W, 4) RGBA: the (non-hidden) sprites alone   # name -> (x0, y0, x1, y1) of drawn sprite pixels
 
 
 @dataclass
@@ -561,7 +562,8 @@ class Renderer:
         return bgs
 
     def render_split(self, st: GBAState, hide_oam=frozenset(), front_of: tuple[int, int] | None = None,
-                     hud_bgs=frozenset(), bounds_for: dict | None = None) -> SplitResult:
+                     hud_bgs=frozenset(), bounds_for: dict | None = None,
+                     picture: bool = True, sprites_only: bool = False) -> SplitResult:
         """Render at 1x as separate layers, so a client can draw its own models in between.
 
         * behind: the frame without the `hide_oam` sprites and without the `hud_bgs` layers
@@ -572,6 +574,10 @@ class Renderer:
         * hud:    RGBA; opaque where one of `hud_bgs` (screen UI such as text boxes) is on top.
 
         Drawing behind, then the models, then front, then hud reproduces the game's layer order.
+
+        With `picture=False` behind/front are skipped (behind is left black); with
+        `sprites_only=True`, `sprites` holds the non-hidden sprites alone on a transparent
+        background (for clients that draw the map themselves).
 
         `bounds_for` maps names to OAM slots; `bounds` then holds the screen box
         (x0, y0, x1 exclusive, y1 exclusive) of those sprites' opaque pixels, whether or not
@@ -589,6 +595,18 @@ class Renderer:
                     bounds[name] = box
         bgs = self._backgrounds()
         sprites = self._plan_sprites(hide_oam)
+        sprite_img = None
+        if sprites_only:
+            srgb, _ = self._evaluate([], sprites, self._grid, hires=False)
+            on = self._top[0] == LAYER_OBJ
+            sprite_img = _rgba(srgb, on) if on.any() else None
+        if not picture:
+            hud_img = None
+            if hud_bgs:
+                hrgb, _ = self._evaluate([bg for bg in bgs if bg.bit in hud_bgs], [], self._grid, hires=False)
+                on = np.isin(self._top[0], list(hud_bgs))
+                hud_img = _rgba(hrgb, on) if on.any() else None
+            return SplitResult(np.zeros((H, W, 3), np.uint8), None, hud_img, bounds, sprite_img)
         rgb, _ = self._evaluate(bgs, sprites, self._grid, hires=False)
         top_bit, top_prio, top_slot = self._top
         hud = np.isin(top_bit, list(hud_bgs)) if hud_bgs else np.zeros(len(top_bit), bool)
@@ -603,7 +621,7 @@ class Renderer:
         behind = rgb
         if hud_img is not None:
             behind, _ = self._evaluate([bg for bg in bgs if bg.bit not in hud_bgs], sprites, self._grid, hires=False)
-        return SplitResult(behind.reshape(H, W, 3), front, hud_img, bounds)
+        return SplitResult(behind.reshape(H, W, 3), front, hud_img, bounds, sprite_img)
 
     def _drawn_box(self, sprites: list[_Sprite]) -> tuple[int, int, int, int] | None:
         if not sprites:

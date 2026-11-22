@@ -34,6 +34,7 @@ def main(argv: list[str] | None = None) -> int:
     w.add_argument("--port", type=int, default=DEFAULT_PORT, help="port the mGBA bridge connects to")
     w.add_argument("--http-host", default="127.0.0.1")
     w.add_argument("--http-port", type=int, default=8765, help="port for the web client and /ws")
+    w.add_argument("--rom", help="ROM file for static game data (default: find it in roms/ by game code)")
 
     e = sub.add_parser("entities", help="print entities extracted from a capture (needs RAM in the capture)")
     e.add_argument("state")
@@ -52,7 +53,7 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "serve":
         from .server import run_server
-        return run_server(args.host, args.port, args.http_host, args.http_port)
+        return run_server(args.host, args.port, args.http_host, args.http_port, rom=args.rom)
 
     if args.cmd == "entities":
         import json

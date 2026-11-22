@@ -4,6 +4,7 @@ from __future__ import annotations
 from .entities import Adapter, World, extract_world
 from .games import find_adapter
 from .protocol import DEFAULT_PORT, FrameReceiver
+from .rom import Rom, find_rom
 from .state import GBAState
 
 
@@ -11,12 +12,25 @@ class LiveSession:
     """Receives frames from the bridge. When the bridge says hello, picks the
     adapter for that game code and asks the bridge for the adapter's RAM ranges."""
 
-    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT, adapters: bool = True):
+    def __init__(self, host: str = "127.0.0.1", port: int = DEFAULT_PORT, adapters: bool = True,
+                 rom: str | None = None):
         self.use_adapters = adapters
         self.adapter: Adapter | None = None
+        self.rom_path = rom
+        self.rom: Rom | None = None
         self.receiver = FrameReceiver(host, port, on_hello=self._on_hello)
 
     def _on_hello(self, code: str, title: str):
+        # The ROM file gives adapters static data (e.g. Pokemon's tilesets for 3D maps).
+        try:
+            self.rom = Rom.open(self.rom_path) if self.rom_path else find_rom(code)
+        except (OSError, ValueError) as e:
+            print(f"[shadow] can't read ROM file {self.rom_path}: {e}")
+            self.rom = None
+        if self.rom is not None and self.rom.game_code != code:
+            print(f"[shadow] {self.rom.path} is {self.rom.game_code!r}, not {code!r}; ignoring it")
+            self.rom = None
+        print(f"[shadow] ROM file: {self.rom.path if self.rom else 'not found (3D maps need it in roms/)'}")
         self.adapter = find_adapter(code) if self.use_adapters else None
         if self.adapter is None:
             print(f"[shadow] no entity adapter for {code!r} - rendering only")
