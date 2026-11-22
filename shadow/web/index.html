@@ -1,0 +1,560 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>gba-shadow 3D</title>
+<style>
+  :root { --bg: #0b0c10; --panel: rgba(17, 19, 24, 0.88); --text: #e6e8ee; --muted: #9aa0ad; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif; overflow: hidden; }
+  canvas { display: block; }
+  details { position: fixed; top: 10px; left: 10px; max-width: min(340px, calc(100vw - 40px));
+    background: var(--panel); border: 1px solid #2a2e38; border-radius: 8px; padding: 6px 10px; }
+  summary { cursor: pointer; font-weight: 600; }
+  #status { color: var(--muted); margin: 6px 0; }
+  #status.ok { color: #7bd88f; }
+  label { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  input[type=range] { flex: 1; }
+  fieldset { border: 0; padding: 0; margin: 3px 0; display: flex; gap: 12px; }
+  pre { margin: 6px 0 0; font: 11px/1.35 ui-monospace, SFMono-Regular, Menlo, monospace;
+    white-space: pre-wrap; color: var(--muted); max-height: 35vh; overflow: auto; }
+</style>
+<script type="importmap">
+  { "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  } }
+</script>
+</head>
+<body>
+<details open>
+  <summary>gba-shadow 3D</summary>
+  <div id="status">connecting…</div>
+  <fieldset>
+    <label><input type="radio" name="view" value="3d" checked> 3D map</label>
+    <label><input type="radio" name="view" value="2d"> 2D picture</label>
+  </fieldset>
+  <label><input id="models" type="checkbox" checked> 3D models</label>
+  <label><input id="hide" type="checkbox" checked> hide original entity sprites</label>
+  <label><input id="front" type="checkbox" checked> layers in front of models (2D)</label>
+  <label><input id="hud" type="checkbox" checked> UI layer (text boxes, menus)</label>
+  <label>model view angle (2D) <input id="angle" type="range" min="15" max="85" value="40"></label>
+  <pre id="info"></pre>
+</details>
+<script type="module">
+import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
+
+// Two views:
+//
+// 3D map: the server sends the current map as geometry (a "diorama" built from the
+// game's own metatile grid, textured from live VRAM). It is drawn with the game's
+// own oblique projection - screen x = x, screen y = z - y, in GBA pixels - so it
+// lines up exactly with the original picture, while depth, occlusion and shading
+// are real 3D. Models stand in the same world. Remaining sprites and the UI layer
+// are drawn on top as flat layers.
+//
+// 2D picture: the game picture stays exactly as on the GBA; models are drawn by a
+// separate 3/4-angle camera and placed over the sprites they replace, in the game's
+// layer order: behind -> models -> front -> hud.
+const W = 240, H = 160;
+const $ = (id) => document.getElementById(id);
+
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.autoClear = false;
+renderer.setClearColor(0x0b0c10);
+document.body.appendChild(renderer.domElement);
+
+// --- screen-space layers -------------------------------------------------------
+const screenCam = new THREE.OrthographicCamera(0, W, 0, -H, -10, 10);
+function makeLayer(scene, order) {
+  const data = new Uint8Array(W * H * 4);
+  const tex = new THREE.DataTexture(data, W, H, THREE.RGBAFormat);
+  tex.magFilter = tex.minFilter = THREE.NearestFilter;
+  tex.colorSpace = THREE.SRGBColorSpace;
+  const geo = new THREE.PlaneGeometry(W, H);
+  const uv = geo.attributes.uv;                // image rows run top -> bottom
+  for (let i = 0; i < uv.count; i++) uv.setY(i, 1 - uv.getY(i));
+  const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+    map: tex, transparent: true, depthTest: false, depthWrite: false }));
+  mesh.position.set(W / 2, -H / 2, 0);
+  mesh.renderOrder = order;
+  mesh.visible = false;
+  scene.add(mesh);
+  return { data, tex, mesh };
+}
+const backScene = new THREE.Scene();
+const overlayScene = new THREE.Scene();
+const layers = {
+  behind: makeLayer(backScene, 0),
+  front: makeLayer(overlayScene, 1),
+  sprites: makeLayer(overlayScene, 2),
+  hud: makeLayer(overlayScene, 3),
+};
+
+// --- cameras -------------------------------------------------------------------
+// 2D view: models seen by a tilted orthographic camera, positioned in screen pixels.
+const modelScene = new THREE.Scene();
+const modelCam = new THREE.OrthographicCamera(-W / 2, W / 2, H / 2, -H / 2, -4000, 4000);
+modelScene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.4));
+const sun = new THREE.DirectionalLight(0xffffff, 1.8);
+sun.position.set(-1, 2, 1.5);
+modelScene.add(sun);
+
+let angle = 40;
+function setAngle(deg) {
+  angle = deg;
+  const t = THREE.MathUtils.degToRad(deg);
+  modelCam.position.set(0, Math.sin(t) * 1000, Math.cos(t) * 1000);
+  modelCam.lookAt(0, 0, 0);
+}
+setAngle(Number($("angle").value));
+$("angle").oninput = (e) => setAngle(Number(e.target.value));
+
+// 3D view: the game's oblique projection. World units are map pixels (x east,
+// z south, y up). The camera looks along -(0,1,1) so lighting has a sensible view
+// direction; the projection matrix maps world -> clip directly:
+//   clip.x = 2(x - ox)/W - 1,  clip.y = 1 - 2(z - y - oy)/H,  depth from y + z.
+const worldScene = new THREE.Scene();
+const worldCam = new THREE.OrthographicCamera(-1, 1, 1, -1, -1, 1);
+worldCam.lookAt(0, -1, -1);
+worldCam.updateMatrixWorld();
+const DEPTH_MIN = -4000, DEPTH_RANGE = 16000;
+let origin = [0, 0];                       // world pixel at the screen's top-left (adapter's camera)
+// Optional orbit (drag on the picture): the world turns around the ground point under
+// the screen centre; it eases back to the game's exact view when released.
+const orbit = { yaw: 0, pitch: 0, dragging: false };
+const _rot = new THREE.Matrix4(), _tmpM = new THREE.Matrix4();
+function setWorldCamera(ox, oy) {
+  const C = new THREE.Matrix4().set(
+    2 / W, 0, 0, -1 - 2 * ox / W,
+    0, 2 / H, -2 / H, 1 + 2 * oy / H,
+    0, -2 / DEPTH_RANGE, -2 / DEPTH_RANGE, 1 + 2 * DEPTH_MIN / DEPTH_RANGE,
+    0, 0, 0, 1);
+  if (orbit.yaw || orbit.pitch) {
+    const px = ox + W / 2, pz = oy + H / 2;
+    _rot.makeTranslation(px, 0, pz)
+      .multiply(_tmpM.makeRotationX(orbit.pitch))
+      .multiply(_tmpM.makeRotationY(orbit.yaw))
+      .multiply(_tmpM.makeTranslation(-px, 0, -pz));
+    C.multiply(_rot);
+  }
+  worldCam.projectionMatrix.multiplyMatrices(C, worldCam.matrixWorld);
+  worldCam.projectionMatrixInverse.copy(worldCam.projectionMatrix).invert();
+}
+renderer.domElement.addEventListener("pointerdown", (e) => {
+  orbit.dragging = true;
+  renderer.domElement.setPointerCapture(e.pointerId);
+});
+renderer.domElement.addEventListener("pointermove", (e) => {
+  if (!orbit.dragging) return;
+  orbit.yaw = THREE.MathUtils.clamp(orbit.yaw + e.movementX * 0.006, -0.9, 0.9);
+  orbit.pitch = THREE.MathUtils.clamp(orbit.pitch + e.movementY * 0.004, -0.5, 0.35);
+});
+renderer.domElement.addEventListener("pointerup", () => { orbit.dragging = false; });
+
+let view = "2d";                           // the view the latest frame was made for
+const in3d = () => view === "3d";
+
+// Ground point under a screen position, in the current view's model space.
+function groundFromScreen(sx, sy, out) {
+  if (in3d()) return out.set(sx + origin[0], 0, sy + origin[1]);
+  return out.set(sx - W / 2, 0, (sy - H / 2) / Math.sin(THREE.MathUtils.degToRad(angle)));
+}
+
+// How far "up the screen" a model-space point (height y, depth z after rotation)
+// appears: the tilted camera foreshortens both, the oblique projection doesn't.
+function screenUp(y, z) {
+  if (in3d()) return y - z;
+  const t = THREE.MathUtils.degToRad(angle);
+  return y * Math.cos(t) - z * Math.sin(t);
+}
+
+// Fit a box model over the screen rectangle the game drew the character in
+// ("drawn": x0, y0, x1, y1). In the game's 3/4 view the bottom of the art is the
+// front of the character's footprint and the top of the art is the top of its
+// head: width = art width, front edge on the bottom line, and a height that makes
+// the projected top reach the top of the art.
+function fitBox([x0, y0, x1, y1]) {
+  const w = Math.max(4, x1 - x0), tall = Math.max(4, y1 - y0);
+  if (in3d()) {
+    const d = tall - w < 4 ? Math.max(2, tall - 4) : w;
+    return { w, d, h: Math.max(4, tall - d), cx: (x0 + x1) / 2, bottom: y1 };
+  }
+  const t = THREE.MathUtils.degToRad(angle), sin = Math.sin(t), cos = Math.cos(t);
+  let d = w;                                      // square footprint (turns in place)
+  if (tall - d * sin < 4 * cos) d = Math.max(2, (tall - 4 * cos) / sin);
+  const h = Math.max(4, (tall - d * sin) / cos);
+  return { w, d, h, cx: (x0 + x1) / 2, bottom: y1 };
+}
+
+// Fit a real model (uniform scale) over the drawn art: measure its silhouette as
+// the current camera sees it at the current yaw, scale it so the silhouette is as
+// tall as the art, and place it so its lowest point sits on the art's bottom line
+// and it is centered horizontally.
+function fitModel(points, yaw, [x0, y0, x1, y1]) {
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  let pmin = Infinity, pmax = -Infinity, xmin = Infinity, xmax = -Infinity;
+  for (let i = 0; i < points.length; i += 3) {
+    const x = points[i], y = points[i + 1], z = points[i + 2];
+    const rx = x * cy + z * sy, rz = -x * sy + z * cy;     // rotation.y = yaw
+    const p = screenUp(y, rz);
+    if (p < pmin) pmin = p;
+    if (p > pmax) pmax = p;
+    if (rx < xmin) xmin = rx;
+    if (rx > xmax) xmax = rx;
+  }
+  const s = Math.max(4, y1 - y0) / (pmax - pmin);
+  // Screen point of the model's origin (screen y grows downwards).
+  return { s, sx: (x0 + x1) / 2 - s * (xmin + xmax) / 2, sy: y1 + s * pmin, h: s * (pmax - pmin) };
+}
+
+const COLORS = { player: 0xff5ca8 };
+const FACING_YAW = { down: 0, right: Math.PI / 2, up: Math.PI, left: -Math.PI / 2 };
+const actors = new Map();
+
+// Models per entity kind (shadow/web/models/<file>, exported from models/*.blend
+// with `make models`), front facing +z. Each is centered with its feet at y=0 and
+// keeps its own proportions: it is scaled uniformly so its silhouette spans the
+// drawn art (see fitModel). Kinds without a model, or whose model hasn't loaded
+// yet, get the cube. A "Walk" animation, if the model has one, plays while the
+// entity moves and fades back to the rest pose when it stops.
+const MODEL_FILES = { player: "player.glb", mom: "mom.glb" };
+// The Walk clip is two steps; the game takes 16 frames (at 59.73 Hz) per step.
+const STEP_SECONDS = 16 / 59.73;
+const models = {};   // kind -> { scene, points, walk }
+const loader = new GLTFLoader();
+for (const [kind, file] of Object.entries(MODEL_FILES)) {
+  loader.load(`models/${file}`, (gltf) => {
+    const root = gltf.scene;
+    const box = new THREE.Box3().setFromObject(root);
+    const center = box.getCenter(new THREE.Vector3());
+    const norm = new THREE.Group();
+    root.position.set(-center.x, -box.min.y, -center.z);
+    norm.add(root);
+    norm.updateMatrixWorld(true);
+    // Every vertex, for measuring the exact on-screen silhouette.
+    const pts = [], v = new THREE.Vector3();
+    norm.traverse((o) => {
+      const pos = o.isMesh && o.geometry.attributes.position;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+        pts.push(v.x, v.y, v.z);
+      }
+    });
+    models[kind] = { scene: norm, points: new Float32Array(pts),
+                     walk: gltf.animations.find((c) => c.name === "Walk") ?? null };
+    for (const a of actors.values()) if (a.userData.kind === kind) setBody(a, kind);
+  }, undefined, (err) => console.warn(`model ${file} failed to load; using a cube`, err));
+}
+
+function setBody(group, kind) {
+  const d = group.userData;
+  if (d.body) group.remove(d.body);
+  if (d.nose) group.remove(d.nose);
+  d.nose = null;
+  d.mixer = d.walk = null;
+  if (models[kind]) {
+    const m = models[kind];
+    const inst = SkeletonUtils.clone(m.scene);
+    inst.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });   // bounds don't follow the bones
+    d.body = new THREE.Group();                 // per-frame fit scale goes here
+    d.body.add(inst);
+    d.body.userData.points = m.points;
+    if (m.walk) {
+      d.mixer = new THREE.AnimationMixer(inst);
+      d.walk = d.mixer.clipAction(m.walk);
+      d.walk.timeScale = m.walk.duration / (2 * STEP_SECONDS);
+      d.walk.setEffectiveWeight(0).play();
+      d.walkWeight = 0;
+    }
+    group.add(d.body);
+    return;
+  }
+  d.body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshStandardMaterial({ color: COLORS[kind] ?? 0x5cc8ff, roughness: 0.5 }));
+  d.nose = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 16), new THREE.MeshStandardMaterial({ color: 0xffffff }));
+  d.nose.rotation.x = Math.PI / 2;
+  group.add(d.body, d.nose);
+}
+
+function makeActor(e) {
+  const group = new THREE.Group();
+  group.userData = { kind: e.kind, box: [0, 0, 0, 0], shown: null, yaw: 0, moving: false, phase: 0, body: null, nose: null };
+  setBody(group, e.kind);
+  modelScene.add(group);
+  return group;
+}
+
+// Screen box for an entity: the drawn art if the server measured it, else a
+// box of the sprite's size standing on the anchor point.
+function entityBox(e) {
+  if (e.drawn) return e.drawn;
+  const [w, h] = e.size ?? [16, 16];
+  return [e.screen[0] - w / 2, e.screen[1] - h, e.screen[0] + w / 2, e.screen[1]];
+}
+
+function updateActors(entities) {
+  const seen = new Set();
+  for (const e of entities) {
+    if (!e.screen) continue;
+    seen.add(e.id);
+    const a = actors.get(e.id) ?? actors.set(e.id, makeActor(e)).get(e.id);
+    const d = a.userData;
+    // Position follows the entity's anchor exactly, in step with the picture (the
+    // scroll moves both by whole pixels on the same frame). Only the art's box
+    // relative to the anchor is smoothed: it changes with animation frames.
+    // A box clipped by the screen edge is ignored so the model doesn't shrink.
+    const box = entityBox(e);
+    d.anchor = e.screen;
+    if (!d.rel || (box[0] > 0 && box[1] > 0 && box[2] < W && box[3] < H))
+      d.rel = [box[0] - e.screen[0], box[1] - e.screen[1], box[2] - e.screen[0], box[3] - e.screen[1]];
+    d.relShown ??= [...d.rel];
+    if (e.facing in FACING_YAW) d.yaw = FACING_YAW[e.facing];
+    d.moving = e.moving;
+  }
+  for (const [id, a] of actors) if (!seen.has(id)) { modelScene.remove(a); actors.delete(id); }
+}
+
+// --- 3D map ----------------------------------------------------------------------
+// The map arrives as quads (4 corners each) with atlas UVs. Floors and the top-layer
+// cards keep the art's exact colours; wall/furniture faces get slight shading.
+const KIND_SHADE = [1.0, 0.86, 1.0, 1.0, 0.68];       // floor, face, top, card, side
+let mapMesh = null, mapTex = null, mapInfo = null;
+const mapMaterial = new THREE.MeshBasicMaterial({ vertexColors: true, alphaTest: 0.5, side: THREE.DoubleSide });
+
+function setAtlas(atlas, shape) {
+  const [h, w] = shape;
+  if (!mapTex || mapTex.image.width !== w || mapTex.image.height !== h) {
+    mapTex?.dispose();
+    mapTex = new THREE.DataTexture(new Uint8Array(w * h * 4), w, h, THREE.RGBAFormat);
+    mapTex.magFilter = mapTex.minFilter = THREE.NearestFilter;
+    mapTex.colorSpace = THREE.SRGBColorSpace;
+    mapMaterial.map = mapTex;
+    mapMaterial.needsUpdate = true;
+  }
+  mapTex.image.data.set(atlas);
+  mapTex.needsUpdate = true;
+}
+
+// Props: real models standing in for furniture drawn into the tiles (shadow/props.py).
+// The server has already replaced their cells with plain floor. Model units are 16 px
+// cells, origin at the footprint's centre on the floor.
+const PROP_SCALE = 16;
+const propModels = {};                     // model name -> Promise<Object3D | null>
+const propGroup = new THREE.Group();
+worldScene.add(propGroup);
+worldScene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.4));   // same light as the characters
+const worldSun = new THREE.DirectionalLight(0xffffff, 1.8);
+worldSun.position.set(-1, 2, 1.5);
+worldScene.add(worldSun);
+function propModel(name) {
+  return propModels[name] ??= loader.loadAsync(`models/${name}.glb`).then((g) => g.scene)
+    .catch((err) => { console.warn(`prop ${name} failed to load`, err); return null; });
+}
+function setProps(list, key) {
+  propGroup.clear();
+  for (const p of list ?? []) {
+    propModel(p.model).then((m) => {
+      if (!m || mapInfo?.key !== key) return;
+      const o = m.clone();
+      o.scale.setScalar(PROP_SCALE);
+      o.position.set(p.x, 0, p.z);
+      o.rotation.y = THREE.MathUtils.degToRad(p.yaw);
+      propGroup.add(o);
+    });
+  }
+}
+
+function setMap(meta, s) {
+  if (mapMesh) { worldScene.remove(mapMesh); mapMesh.geometry.dispose(); mapMesh = null; }
+  mapInfo = meta.key ? meta : null;
+  setProps(meta.props, meta.key);
+  if (!meta.key) return;
+  setAtlas(s.atlas.data, s.atlas.shape);
+  const n = meta.quads;
+  const colors = new Float32Array(n * 4 * 3);
+  for (let q = 0; q < n; q++) {
+    const shade = KIND_SHADE[s.kinds.data[q]] ?? 1;
+    for (let v = 0; v < 4; v++) colors.set([shade, shade, shade], (q * 4 + v) * 3);
+  }
+  const index = new Uint32Array(n * 6);
+  for (let q = 0; q < n; q++) index.set([q * 4, q * 4 + 1, q * 4 + 2, q * 4, q * 4 + 2, q * 4 + 3], q * 6);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute("position", new THREE.BufferAttribute(s.positions.data, 3));
+  geo.setAttribute("uv", new THREE.BufferAttribute(s.uvs.data, 2));
+  geo.setAttribute("color", new THREE.BufferAttribute(colors, 3));
+  geo.setIndex(new THREE.BufferAttribute(index, 1));
+  mapMesh = new THREE.Mesh(geo, mapMaterial);
+  mapMesh.frustumCulled = false;
+  worldScene.add(mapMesh);
+}
+
+// --- networking ----------------------------------------------------------------------
+const DTYPES = { uint8: Uint8Array, float32: Float32Array, uint16: Uint16Array, int32: Int32Array };
+function parseBlob(buf, meta, pos) {
+  const view = new DataView(buf), out = {};
+  for (const sec of meta.sections ?? []) {
+    const size = view.getUint32(pos, true);
+    pos += 4;
+    const T = DTYPES[sec.dtype];
+    out[sec.name] = { data: new T(buf.slice(pos, pos + size)), shape: sec.shape };
+    pos += size;
+  }
+  return out;
+}
+
+let ws, frames = 0, lastMeta = null;
+const chosenView = () => document.querySelector("input[name=view]:checked").value;
+const sendSettings = () => ws?.readyState === 1 &&
+  ws.send(JSON.stringify({ hide_entity_sprites: $("hide").checked, view: chosenView() }));
+function connect() {
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = sendSettings;
+  ws.onmessage = (ev) => {
+    const view_ = new DataView(ev.data);
+    const n = view_.getUint32(0, true);
+    const meta = JSON.parse(new TextDecoder().decode(new Uint8Array(ev.data, 4, n)));
+    if (meta.type === "map") { setMap(meta, parseBlob(ev.data, meta, 4 + n)); return; }
+    if (meta.type === "atlas") {
+      const s = parseBlob(ev.data, meta, 4 + n);
+      if (mapInfo && meta.key === mapInfo.key) setAtlas(s.atlas.data, s.atlas.shape);
+      return;
+    }
+    let pos = 4 + n;
+    for (const name of Object.keys(layers)) layers[name].mesh.visible = false;
+    for (const name of meta.layers) {
+      const size = view_.getUint32(pos, true);
+      pos += 4;
+      const layer = layers[name];
+      if (layer && size) {
+        layer.data.set(new Uint8Array(ev.data, pos, size));
+        layer.tex.needsUpdate = true;
+        layer.mesh.visible = true;
+      }
+      pos += size;
+    }
+    view = meta.view === "3d" && mapMesh ? "3d" : "2d";
+    if (meta.camera?.origin) origin = meta.camera.origin;
+    updateActors(meta.entities);
+    lastMeta = window.lastMeta = meta;
+    frames++;
+  };
+  ws.onclose = () => { $("status").textContent = "disconnected - retrying…"; $("status").className = ""; setTimeout(connect, 1000); };
+}
+connect();
+$("hide").onchange = sendSettings;
+for (const el of document.querySelectorAll("input[name=view]")) el.onchange = sendSettings;
+
+setInterval(() => {
+  if (!lastMeta) { $("status").textContent = "connected - waiting for frames from mGBA…"; return; }
+  $("status").className = "ok";
+  const shown = Object.entries(layers).filter(([, l]) => l.mesh.visible).map(([k]) => k).join(" + ");
+  const where = in3d() ? `3D map (${mapInfo?.shape?.join("x")} cells)` : "2D picture";
+  $("status").textContent = `${lastMeta.game ?? "?"} · frame ${lastMeta.frame} · ${frames} fps · ${where} · ${shown}`;
+  frames = 0;
+  const p = lastMeta.entities[0];
+  $("info").textContent = p
+    ? JSON.stringify({ ...p, props: undefined, front_of: lastMeta.front_of }, null, 1)
+    : (lastMeta.error ?? "no entities (not in the overworld?)");
+}, 1000);
+
+// --- render loop -----------------------------------------------------------------------
+function resize() { renderer.setSize(window.innerWidth, window.innerHeight); }
+window.addEventListener("resize", resize);
+resize();
+
+// For tests and debugging: window.gbaShadow.picture = false hides the game picture,
+// window.gbaShadow.updateActors([...]) places models without a game running.
+const debug = window.gbaShadow = { picture: true, updateActors, orbit, get view() { return view; } };
+
+const clock = new THREE.Clock();
+const tmp = new THREE.Vector3();
+renderer.setAnimationLoop(() => {
+  const dt = Math.min(clock.getDelta(), 0.1);
+  if (!orbit.dragging && !orbit.hold) {               // ease back to the game's view
+    const k = Math.exp(-dt * 5);
+    orbit.yaw = Math.abs(orbit.yaw * k) < 1e-4 ? 0 : orbit.yaw * k;
+    orbit.pitch = Math.abs(orbit.pitch * k) < 1e-4 ? 0 : orbit.pitch * k;
+  }
+  for (const a of actors.values()) {
+    const d = a.userData;
+    d.shown ??= [0, 0, 0, 0];
+    const k = 1 - Math.exp(-dt * 30);                  // smooth changes in the art's shape
+    for (let i = 0; i < 4; i++) {
+      d.relShown[i] += (d.rel[i] - d.relShown[i]) * k;
+      d.shown[i] = d.anchor[i % 2] + d.relShown[i];
+    }
+    let dy = d.yaw - a.rotation.y;
+    dy = Math.atan2(Math.sin(dy), Math.cos(dy));
+    a.rotation.y += dy * (1 - Math.exp(-dt * 15));
+    d.phase = d.moving ? d.phase + dt * 14 : 0;
+    const points = d.body.userData.points;
+    if (points) {
+      const m = fitModel(points, a.rotation.y, d.shown);
+      a.position.copy(groundFromScreen(m.sx, m.sy, tmp));
+      d.body.scale.setScalar(m.s);
+      if (d.mixer) {
+        // Fade the walk in and out; it keeps its place in the cycle while stopped,
+        // so brief stops between steps don't restart the stride.
+        d.walkWeight += ((d.moving ? 1 : 0) - d.walkWeight) * (1 - Math.exp(-dt * 12));
+        d.walk.setEffectiveWeight(d.walkWeight);
+        d.walk.paused = d.walkWeight < 0.01;
+        d.mixer.update(dt);
+        d.body.position.y = 0;
+      } else {
+        d.body.position.y = Math.abs(Math.sin(d.phase)) * Math.min(1.5, m.h * 0.06);
+      }
+      continue;
+    }
+    const f = fitBox(d.shown);
+    // Front edge of the footprint on the art's bottom line.
+    a.position.copy(groundFromScreen(f.cx, f.bottom, tmp));
+    a.position.z -= f.d / 2;
+    const bob = Math.abs(Math.sin(d.phase)) * Math.min(1.5, f.h * 0.06);
+    d.body.scale.set(f.w, f.h, f.d);
+    d.body.position.y = f.h / 2 + bob;
+    if (d.nose) {
+      const r = Math.max(1, Math.min(f.w, f.h) * 0.18);
+      d.nose.scale.set(r, r, r);
+      d.nose.position.set(0, f.h * 0.6 + bob, f.d / 2 + r);
+    }
+  }
+
+  // Letterbox the 240x160 picture into the window.
+  const cw = window.innerWidth, ch = window.innerHeight;
+  const s = Math.min(cw / W, ch / H);
+  const vw = W * s, vh = H * s, vx = (cw - vw) / 2, vy = (ch - vh) / 2;
+  renderer.setScissorTest(false);
+  renderer.setViewport(0, 0, cw, ch);
+  renderer.clear();
+  renderer.setViewport(vx, vy, vw, vh);
+  renderer.setScissor(vx, vy, vw, vh);
+  renderer.setScissorTest(true);
+
+  layers.behind.mesh.visible &&= debug.picture && !in3d();
+  layers.front.mesh.visible &&= $("front").checked && !in3d();
+  layers.sprites.mesh.visible &&= in3d();
+  layers.hud.mesh.visible &&= $("hud").checked;
+  if (in3d()) {
+    // Map and models share one depth buffer, so walls and furniture hide models properly.
+    setWorldCamera(origin[0], origin[1]);
+    if (debug.picture) renderer.render(worldScene, worldCam);
+    if ($("models").checked) renderer.render(modelScene, worldCam);
+  } else {
+    renderer.render(backScene, screenCam);
+    if ($("models").checked) {
+      renderer.clearDepth();
+      renderer.render(modelScene, modelCam);
+    }
+  }
+  renderer.render(overlayScene, screenCam);
+});
+</script>
+</body>
+</html>

@@ -39,25 +39,65 @@ patterns.*
   its hashes, so you can collect a game's graphics just by playing it.
 - **Viewer** (`python -m shadow view`): live window with sprite-box overlay,
   replacement toggle and screenshots.
+- **Entities** (`shadow/games/`): per-game adapters read the game's own objects
+  from work RAM and turn them into entities (position, tile, facing, moving, and
+  the sprite slots that draw them). Included: **Pokémon Emerald (US): the
+  player and NPCs, plus the map for 3D**, and the test ROM.
+- **WebSocket output + 3D demo** (`python -m shadow serve`): publishes every
+  frame plus its entities, split into layers behind and in front of the player
+  plus UI. A three.js page shows the game from its original point of view, with
+  a model (or a cube) in place of each entity's sprite, drawn in the game's own layer order.
+- **3D maps** (Pokémon Emerald, with its ROM in `roms/`): the map itself becomes
+  3D geometry, built from the game's own metatile grid and textured from live
+  VRAM. From the game's point of view it matches the original picture pixel for
+  pixel; drag the picture to turn the room and see it's real 3D.
 
 ## Quick start
 
-Requirements: mGBA **0.10 or newer** (needs scripting support), Python 3.10+.
+Requirements: Python 3.10+ and, on Ubuntu/Debian:
+
+```bash
+sudo apt install mgba-qt libmgba-dev libsdl2-dev
+```
 
 ```bash
 pip install -r requirements.txt
 ```
 
+Put your ROM in `roms/` (git ignores everything in there), then:
+
 ```bash
-python -m shadow view
+./start.py
 ```
 
-Then in mGBA, load your ROM and open **Tools → Scripting… → File → Load script**,
-and pick `lua/shadow_bridge.lua`. The view appears within a second. The order doesn't
-matter: the script retries the connection every 60 frames.
+That builds `player/shadow-play` on first use, starts the WebSocket server,
+launches the game with the bridge already loaded, and opens the 3D web client.
+Close the game window to stop everything. Options:
+
+```bash
+./start.py emerald          # pick a ROM by part of its file name, if roms/ has several
+./start.py --view           # pygame viewer instead of the web client
+./start.py --dump dumps/mygame   # viewer + dump new sprites (see below)
+./start.py --pack packs/mygame   # viewer with your replacement graphics
+./start.py --emulator mgba  # use the mGBA app instead of shadow-play
+```
+
+**shadow-play** is a minimal player built on libmgba, the library under mGBA, so
+the emulation is the same. It exists because mGBA 0.10 can't load a Lua script
+from the command line. Controls: arrows, **X** = A, **Z** = B, **A**/**S** =
+L/R, **Enter** = Start, **Backspace** = Select, hold **Tab** to fast-forward,
+**F5**/**F8** to save/load a state, **Esc** to quit. Game controllers work too.
+Battery saves go next to the ROM, as in mGBA, so mGBA can read them as well.
+
+**With the mGBA app** (`--emulator mgba`, or if shadow-play can't be built),
+load the script by hand: **Tools → Scripting… → File → Load script** and pick
+`lua/shadow_bridge.lua`. The order doesn't matter: the script retries the
+connection every 60 frames. To run the pieces separately, start
+`python -m shadow serve` (or `view`) first.
 
 Viewer keys: **B** sprite boxes (green = replaced, yellow = original, blue = OBJ window),
-**R** toggle replacements, **S** screenshot, **Esc** quit.
+**E** entity overlay, **H** hide entity sprites, **R** toggle replacements,
+**S** screenshot, **Esc** quit.
 
 ## Making replacement graphics
 
@@ -92,6 +132,210 @@ Viewer keys: **B** sprite boxes (green = replaced, yellow = original, blue = OBJ
 `tools/make_demo_pack.py DUMP_DIR PACK_DIR` turns a dump into a test pack
 (Scale2x + outlines). It's useful for checking the pipeline before you have real art.
 
+## Entities and 3D
+
+```bash
+python -m shadow serve
+```
+
+![three.js client on the test ROM: a cube replaces the player sprite; left, layers that are in front of the player (priority-0 tiles and a sprite) still cover it; right, the same frame with that layer switched off](docs/3d-client.png)
+
+Load the bridge in mGBA as usual (or use `./start.py`, which does it all) and
+open http://127.0.0.1:8765. The page shows the game from the original point of
+view, with the player's sprite replaced by a cube. The cube has a "nose" showing
+which way the player faces, and it bobs while walking. The panel shows the live
+entity data and has switches for each layer. The page loads three.js from
+jsDelivr, so the browser needs internet access.
+
+**Draw order.** The game picture isn't one flat image. The server splits it the
+way the GBA layers it, relative to the player's sprite:
+
+- **behind:** everything the GBA draws behind the player
+- **front:** what it draws in front of the player: map layers with a lower
+  priority number, such as Emerald's bed covers, roofs and treetops, and other
+  sprites with better priority or an earlier sprite slot
+- **hud:** layers the adapter marks as screen UI (Emerald: BG0, the text boxes and menus)
+
+The client draws behind, then the 3D models, then front, then hud, which is
+the game's own order. Priorities are read from the player's sprite every frame,
+so elevation changes (bridges, where Emerald raises the player to priority 1)
+are handled too.
+
+**Camera.** The picture is drawn exactly as on the GBA, letterboxed to the
+window. Models are drawn by a second camera with the same scale (1 unit = 1
+GBA pixel) that looks down at the 3/4 angle of the game's art (adjustable in the
+panel). Each model is fitted over the rectangle the game draws the character
+in: the server measures the opaque pixels of the entity's sprites every frame
+(`drawn` in the JSON). In the 3/4 view, the bottom of that rectangle is the front
+of the character's footprint and the top is the top of its head. So the model is
+as wide as the art, its front edge sits on the bottom line, and its height is
+chosen so its top reaches the top of the art at the current view angle. The
+model then covers the same pixels as the original sprite, and the layers in
+front of it line up the same way.
+
+In the pygame viewer (`python -m shadow view`) the same entities are drawn as
+an overlay: **E** toggles the overlay and **H** hides the entities' sprites.
+
+**How it fits together**
+
+1. When the bridge connects it sends a *hello* with the ROM's game code
+   (e.g. `BPEE`).
+2. The renderer looks up an adapter for that code (`shadow/games/`) and replies
+   with the work-RAM ranges the adapter needs. The bridge then streams those
+   ranges every frame, diffed like video memory.
+3. Each frame, the adapter turns the mirrored RAM into `Entity` objects
+   (`shadow/entities.py`):
+
+   | field    | meaning |
+   |----------|---------|
+   | `id`, `kind` | stable id and type: `"player"`; Emerald NPCs are `"<kind>:<mapGroup>.<mapNum>.<localId>"` with kind `"mom"` or `"npc"` |
+   | `screen` | anchor point on the GBA screen (middle of the feet) |
+   | `pos`    | the same point in world pixels (Emerald: map pixels, origin at the map's top-left) |
+   | `tile`   | the tile the game thinks the entity is on |
+   | `facing`, `moving` | `"down"`/`"up"`/`"left"`/`"right"`, walking or not |
+   | `size`   | sprite size in GBA pixels |
+   | `oam`    | hardware sprite slots that draw this entity (what to hide) |
+   | `props`  | everything else the adapter knows |
+
+4. `serve` sends one binary WebSocket message per frame on `/ws`:
+   `u32 json_length | JSON`, then for each name in `JSON.layers`
+   (`behind`, `front`, `hud`) a `u32 size` and that many bytes of 240x160
+   RGBA. A size of 0 means the layer is empty this frame. The JSON holds the
+   entity list, camera, game code, frame number, `hidden_oam` (the sprite slots
+   removed), `front_of` (the entity, priority and slot the split was made
+   for) and, per entity, `drawn`: the screen box `[x0, y0, x1, y1]` of its
+   original sprite pixels. Send `{"hide_entity_sprites": false}` to get one unsplit frame with the
+   original sprites instead. Any engine (Godot, Unity, Bevy, three.js...) can
+   consume this. `shadow/server.py` has `decode_frame()` for Python clients.
+
+**Timing.** Pokémon, like most games, runs its logic and then copies sprite
+positions to the hardware in the *next* VBlank. RAM read at VBlank is therefore
+one frame ahead of the picture. Adapters declare this (`ram_delay = 1`), and the
+bridge then sends RAM from the previous frame along with the current picture.
+The test ROM does the same, and a test checks that with the delay the entity
+matches its sprite on every frame (and without it, it doesn't).
+
+**Pokémon Emerald adapter** (`shadow/games/pokeemerald.py`)
+
+- US English Emerald only (game code `BPEE`). Addresses come from the
+  [pret/pokeemerald](https://github.com/pret/pokeemerald) decompilation's symbol
+  map. Other languages need their own addresses.
+- The player (always the first entity) and every other active object event whose
+  sprite is on screen, only while the overworld is running (`gMain.callback2 ==
+  CB2_Overworld`). There are no entities in battles or menus. NPC kinds come from
+  their graphics id (`KIND_BY_GRAPHICS_ID`: 215 is `"mom"`; everything else is
+  `"npc"`, with `graphics_id` and `local_id` in `props`).
+- `pos` is exact and smooth. It's derived from the sprite position and the
+  camera's scroll counters the same way the game places field sprites. It
+  changes frame of reference when you cross into a connected map (the `map`
+  prop changes at the same moment).
+- `props` include the previous tile, bike/surf/dash flags, elevation, graphics
+  id, ledge-jump offset and the sprite's animation number and frame.
+- The decompilation's struct layouts and formulas are covered by tests with
+  hand-built memory. **It hasn't been run against a real Emerald ROM yet**, so
+  expect to adjust things on the first real run. `python -m shadow entities
+  capture.gbsh --game BPEE` prints what the adapter sees in a capture (set
+  `SHADOW_WATCH` for captures, see the bridge's header).
+
+**Writing an adapter.** Add a module to `shadow/games/` with an object that has
+`name`, `game_codes`, `ram_ranges` (bus address, length), `ram_delay`, and
+`extract(state) -> (entities, camera)`. Read memory with `state.u8/s16/u32(...)`
+at bus addresses: reading anything not in `ram_ranges` raises, so missing
+ranges show up immediately. Then register it in `shadow/games/__init__.py`.
+`shadow/games/shadowtest.py` is the smallest example.
+
+## 3D maps
+
+![Mom's house built from the game's own data: left, the game's view (identical to the original picture); right, the same scene turned](docs/3d-map.png)
+
+The web client's **3D map** view (the default) replaces the background picture
+with geometry. It's available when the adapter can read the map: for Pokémon
+Emerald, `./start.py` passes your ROM file to the server (`serve --rom ...`), or
+the server finds it in `roms/` by game code. Otherwise the client falls back to
+the 2D picture view. Drag the picture to turn the scene; it springs back to the
+game's view when you let go.
+
+**Where the data comes from.** Emerald keeps the current map in RAM as a grid of
+16x16 *metatiles*, each with a metatile id, a collision flag and an elevation
+(`gBackupMapLayout`, streamed by the bridge, including the 7-cell border). The
+metatile definitions (which 8x8 tiles, which palette, which layer) and
+attributes come from the tilesets `gMapHeader` points to, read from the ROM file.
+The pixels come from live VRAM and palette RAM, so animated tiles and palette
+fades show up. When the game changes a metatile (a door opening), the map is
+rebuilt.
+
+**How the geometry is built** (`shadow/tilemap.py`):
+
+- **Camera:** the game's own *oblique* projection: the floor maps 1:1 to the
+  screen and anything with height moves straight up by its height
+  (`screen y = z - y`, in GBA pixels). The client uses exactly that projection,
+  so the geometry lines up with the original art and the models stand in the
+  same world.
+- **Floor:** walkable cells become floor tiles with their art.
+- **Walls and furniture:** impassable cells (except water, ledges and the border)
+  become blocks. A run of up to 4 such cells going north is one block standing
+  on the southern cell: its front face carries the run's art and its top the
+  top half of the northmost cell. That covers exactly the same screen area the
+  cells did, so the picture is unchanged, but the blocks now have depth and
+  hide models standing behind them.
+- **Parts drawn over characters** (bed covers and similar, the game's top BG
+  layer): upright cards on the cell's south edge, so a model standing in the
+  cell is behind them.
+- **Turned views only:** block sides and the floor under blocks.
+
+`tilemap.rasterize()` is a reference software renderer for this projection.
+The tests check that the diorama, seen through it, is identical to the cells'
+art laid out flat. A Mom's-house fixture built from the decompilation's
+assets matched the original picture with 0 differing pixels.
+
+**Limits of the automatic version.** It only knows "walkable" and "impassable",
+not what an object is. So furniture becomes simple blocks whose height comes from
+how many cells it spans. The prop kit (below) fixes that one piece of furniture at
+a time. Outdoor maps work the same way, but elevation (cliffs) and map connections
+aren't used yet. Sprites that aren't entities (effects, items) are drawn as a
+flat layer on top of the 3D scene.
+
+### Prop kit: real furniture models
+
+![Brendan's house table and chairs as 3D models: left, the game's view; right, turned](docs/3d-props.png)
+
+A prop kit swaps furniture drawn into the tiles for real 3D models. Each entry
+(`PropDef` in `shadow/props.py`) names a tileset, a pattern of metatile ids (a
+2x2 table, a single chair), the model, an anchor and a facing. The Emerald kit
+is `PROP_KIT` in `shadow/games/pokeemerald.py`. So far it has the dining table and
+the green chairs in Brendan's house (and the chairs in May's house).
+
+- Where a pattern matches, its cells lose their block and get a plain floor drawn
+  from the metatile's **bottom layer** only. Emerald draws furniture on the layer
+  above the floor, so this is the rug without the table, including the rug's own
+  drop shadows.
+- The map message lists the placed props (`props`: model, world x/z, yaw, cells),
+  and the client stands `shadow/web/models/<model>.glb` there.
+- Models: 1 Blender unit = one 16 px cell, origin at the centre of the footprint
+  on the floor, front/+x as in the art. Sizes are measured from the art as the
+  game's projection shows it, so from the game's point of view a model covers
+  about the same pixels as the original tiles.
+- `tools/model_props.py` builds `models/props/*.blend` from code (`make
+  props-blend`). The .blend files are then the source: edit them in Blender,
+  then `make models` exports them to `shadow/web/models/prop_*.glb`.
+
+Adding a prop: find the metatile ids (the map grid is in `gBackupMapLayout`;
+`tm.cells` in the adapter's `tilemap()`), measure the art, model it, and add a
+`PropDef`.
+
+## Screenshots without a ROM
+
+`tools/emerald_fixture.py` builds a realistic Emerald game state for any map from the
+pret/pokeemerald decompilation (fetched on demand into the git-ignored `build/`), and
+`tools/screenshot.py` captures the web client with it in headless Chromium, including
+turned views:
+
+```bash
+python3 tools/screenshot.py LittlerootTown_BrendansHouse_1F --player 5,4 --orbit 0.6,-0.25
+```
+
+See `CLAUDE.md` for the full workflow (live screenshots, debug hooks, measuring).
+
 ## Checking the renderer against mGBA
 
 The bridge can also save full snapshots plus mGBA's own screenshot of the same
@@ -117,7 +361,8 @@ No commercial ROM is needed for development:
 
 - `testrom/`: a small homebrew ROM (C, built with the stock `gcc-arm-none-eabi`)
   that cycles through every video mode and the sprite, window and blending features
-  above. A prebuilt `shadowtest.gba` is included.
+  above. It also keeps a one-entry entity table in RAM for testing adapters.
+  A prebuilt `shadowtest.gba` is included.
 - `harness/shadow-run`: runs a ROM plus a Lua script under libmgba with no GUI,
   using the same scripting API as mGBA's Qt frontend. It's used for automated
   captures and the end-to-end test.
@@ -135,7 +380,7 @@ make selftest   # captures ~120 frames headlessly and verifies them against mGBA
 ```
 
 ```bash
-make test       # pytest: renderer vs mGBA fixtures, packs/dumps, protocol, bridge end-to-end
+make test       # pytest: renderer vs mGBA fixtures, packs/dumps, protocol, entities, bridge end-to-end
 ```
 
 ## Performance (this machine, NumPy renderer)
@@ -166,26 +411,56 @@ but a full HD pack at 60 fps needs the GPU port listed below.
   The hashing/plan step stays on the CPU.
 - **Bitmap modes (3–5)** aren't replaceable (there are no tiles to identify), and
   **mosaic** and the per-line sprite pixel budget aren't emulated.
-- **Metasprites.** Replacements are per OAM entry. Treating a multi-sprite
-  character as one image needs grouping, or reading the game's own object
-  table from RAM. That's also where 3D models would hook in.
+- **Layering approximations.** The front/behind split is made relative to one
+  entity (the player). Other entities' models are ordered against each other
+  by 3D depth. Layers that are alpha-blended over the player (some text boxes)
+  cover the model fully instead of blending. Screen fades done through
+  palettes (most of Emerald's) darken the picture but not the models. The
+  server would need to pass the fade level along for that.
+- **3D maps.** More props for the prop kit (so far: Brendan's house table and
+  chairs; May's table has another cloth colour and no model yet), a map exporter
+  for modelling rooms in Blender, elevation for outdoor cliffs, and stitching
+  connected maps.
+- **More entities.** The Emerald adapter covers the player and NPCs, but only
+  the mom has a kind (and a model) of her own. Next: more kinds, and a RAM
+  inspector tool for games without a decompilation.
+- **Metasprites.** Sprite *replacements* are still per OAM entry. Entities
+  already know all the slots that draw them, so whole-character replacements
+  can build on that.
 - Tested headlessly against libmgba 0.10.2 (same scripting engine as the GUI),
   not yet inside the mGBA Qt app on a desktop.
 
 ## Layout
 
 ```
-lua/shadow_bridge.lua   mGBA script: state streaming + capture mode
+start.py                starts renderer + emulator + browser
+roms/                   your ROMs (git-ignored)
+lua/shadow_bridge.lua   mGBA script: state + RAM streaming, capture mode
 shadow/                 Python package (python -m shadow …)
-  protocol.py           wire format, TCP receiver, capture loading
-  state.py              GBA display state + register accessors
+  protocol.py           wire format, TCP receiver (hello/watch), capture loading
+  state.py              GBA display state, watched RAM, register accessors
   render.py             reference renderer + replacement compositing
   pack.py               hashing, replacement packs, dumper
+  entities.py           Entity / World model, adapter interface
+  tilemap.py            tile map -> 3D diorama, texture atlas, reference rasterizer
+  props.py              prop kit: furniture models in place of tiles
+  rom.py                ROM file access (finds ROMs in roms/ by game code)
+  games/                game adapters (pokeemerald.py, shadowtest.py)
+  session.py            bridge connection + adapter selection
+  server.py             WebSocket server (python -m shadow serve)
+  web/index.html        three.js demo client
+  web/models/           exported .glb models (characters, prop_*.glb)
+models/                 Blender sources (characters; props/ for furniture)
   viewer.py             pygame window
   verify.py             renderer-vs-mGBA comparison
 tools/make_demo_pack.py demo pack generator
+tools/model_props.py    builds the prop .blend files from code
+tools/export_glb.py     .blend -> .glb (make models)
+tools/emerald_fixture.py  Emerald game state for any map, from the decomp (no ROM)
+tools/screenshot.py     web client screenshots (fixture or running server)
 testrom/                homebrew test ROM (C)
 harness/                headless libmgba runner (C)
+player/                 shadow-play: libmgba + SDL2 player that loads the bridge at startup (C)
 tests/                  pytest suite + mGBA capture fixtures
 ```
 
@@ -193,5 +468,11 @@ tests/                  pytest suite + mGBA capture fixtures
 
 Little endian. Header `"GBSH" u8 version u8 flags u16 count u32 frame u32 payload_len`,
 followed by `count` records of `u8 region u32 offset u32 length` + bytes. Regions:
-0 = I/O registers (first 0x60 bytes), 1 = palette, 2 = VRAM, 3 = OAM. Flag bit 0 marks a
-full snapshot; `.gbsh` capture files are a single full-snapshot message.
+0 = I/O registers (first 0x60 bytes), 1 = palette, 2 = VRAM, 3 = OAM, 4 = EWRAM,
+5 = IWRAM (offsets relative to the region). Flag bit 0 marks a full snapshot. Flag bit 1
+marks a *hello*: its payload is two length-prefixed strings (game code, title) and it
+has no records. `.gbsh` capture files are a single full-snapshot message.
+
+The renderer answers a hello with a watch request:
+`"GBSW" u8 version u8 flags u16 count`, then `count` × `u32 bus_address u32 length`.
+Flag bit 0 asks for RAM to be delayed by one frame. A new request replaces the old one.

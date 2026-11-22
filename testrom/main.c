@@ -220,17 +220,35 @@ static void draw_mode5(void) {
 
 // ---------------------------------------------------------------- sprites
 
+// Like most commercial games, sprites are built in a RAM copy of OAM during
+// game logic and copied to the real OAM at the start of the next VBlank.
+static u16 shadow_oam[512];
+
 static void set_obj(u32 i, u16 a0, u16 a1, u16 a2) {
-    OAM[i * 4 + 0] = a0;
-    OAM[i * 4 + 1] = a1;
-    OAM[i * 4 + 2] = a2;
+    shadow_oam[i * 4 + 0] = a0;
+    shadow_oam[i * 4 + 1] = a1;
+    shadow_oam[i * 4 + 2] = a2;
 }
 static void set_affine(u32 set, s32 pa, s32 pb, s32 pc, s32 pd) {
-    OAM[set * 16 + 3] = (u16)pa;
-    OAM[set * 16 + 7] = (u16)pb;
-    OAM[set * 16 + 11] = (u16)pc;
-    OAM[set * 16 + 15] = (u16)pd;
+    shadow_oam[set * 16 + 3] = (u16)pa;
+    shadow_oam[set * 16 + 7] = (u16)pb;
+    shadow_oam[set * 16 + 11] = (u16)pc;
+    shadow_oam[set * 16 + 15] = (u16)pd;
 }
+static void upload_oam(void) {
+    for (u32 i = 0; i < 512; ++i) OAM[i] = shadow_oam[i];
+}
+
+// Entity table at a fixed EWRAM address, read by shadow/games/shadowtest.py.
+struct Entity {
+    u8 active;
+    u8 kind;        // 1 = player
+    u8 facing;      // 1 down, 2 up, 3 left, 4 right (Pokemon's DIR_* values)
+    u8 oam_slot;
+    s16 x, y;       // top-left of the sprite in screen pixels
+    u16 width, height;
+};
+#define ENTITIES ((volatile struct Entity*)0x02000000)
 
 // attr helpers
 #define A0(y, aff, dbl_or_hide, mode, bpp8, shape) \
@@ -246,8 +264,17 @@ static void update_sprites(int scene, s32 t) {
     s32 sc = 128 + (isin(t * 3) + 256) / 2;
     set_affine(1, sc, isin(t) / 8, 0, sc);
 
-    // 0: 32x32 moving across the left edge (exercises 9-bit X wrap)
-    set_obj(0, A0(20, 0, 0, 0, 0, 0), A1((t * 2) % 300 - 30, 0, 0, 2), A2(512, 0, 1));
+    // 0: 32x32 "player" moving across the left edge (exercises 9-bit X wrap)
+    s32 px = (t * 2) % 300 - 30;
+    set_obj(0, A0(20, 0, 0, 0, 0, 0), A1(px, 0, 0, 2), A2(512, 1, 1));   // priority 1: BG3 + sprite 12 pass in front
+    ENTITIES[0].active = 1;
+    ENTITIES[0].kind = 1;
+    ENTITIES[0].facing = 4;
+    ENTITIES[0].oam_slot = 0;
+    ENTITIES[0].x = px;
+    ENTITIES[0].y = 20;
+    ENTITIES[0].width = 32;
+    ENTITIES[0].height = 32;
     // 1: 16x16 hflip moving through the top edge (8-bit Y wrap)
     set_obj(1, A0(t % 200 - 20, 0, 0, 0, 0, 0), A1(100, 1, 0, 1), A2(520, 1, 2));
     // 2: 64x32 vflip
@@ -392,16 +419,17 @@ int main(void) {
     u32 frame = 0;
     int scene = -1;
     for (;;) {
-        vsync();
         int s = (frame / SCENE_LEN) % NSCENES;
         s32 t = frame % SCENE_LEN;
         if (s != scene) {
+            vsync();
             setup_scene(s);       // takes several frames; display stays blanked
             scene = s;
-            vsync();              // apply the new scene's registers at a frame boundary
         }
+        update_sprites(s, t);     // game logic: entity table + shadow OAM for frame t
+        vsync();
+        upload_oam();             // VBlank: show what the logic built
         update_scene(s, t);
-        update_sprites(s, t);
         ++frame;
     }
 }
