@@ -15,10 +15,19 @@ player:
 	$(MAKE) -C player
 
 # Re-export the Blender models the web client loads (make models BLENDER=/path/to/blender).
-models: shadow/web/models/player.glb shadow/web/models/mom.glb
+# Props (models/props/*.blend, made by tools/model_props.py) become prop_<name>.glb.
+PROPS = $(patsubst models/props/%.blend,shadow/web/models/prop_%.glb,$(wildcard models/props/*.blend))
+models: shadow/web/models/player.glb shadow/web/models/mom.glb $(PROPS)
+
+shadow/web/models/prop_%.glb: models/props/%.blend tools/export_glb.py
+	$(BLENDER) -b $< --python tools/export_glb.py -- $@
 
 shadow/web/models/%.glb: models/%.blend tools/export_glb.py
 	$(BLENDER) -b $< --python tools/export_glb.py -- $@
+
+# Rebuild the prop .blend files from code (overwrites hand edits to them).
+props-blend:
+	$(BLENDER) -b --python tools/model_props.py
 
 # Capture ~120 frames of the test ROM headlessly, then compare the renderer against mGBA.
 selftest: all
@@ -36,4 +45,4 @@ clean:
 	$(MAKE) -C player clean
 	rm -rf build
 
-.PHONY: all rom harness player models selftest test clean
+.PHONY: all rom harness player models props-blend selftest test clean

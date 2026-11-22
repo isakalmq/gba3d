@@ -26,7 +26,9 @@ and "hud" layers, and separate messages describe the map:
     u32 json_length | json | for each entry in json["sections"]: u32 n | n bytes
 
     {"type": "map", ...}    atlas (RGBA), positions (n,4,3 f32), uvs (n,4,2 f32),
-                            normals (n,3 f32), kinds (n u8); sent when the map changes
+                            normals (n,3 f32), kinds (n u8); sent when the map changes.
+                            json["props"]: models standing in for furniture (shadow/props.py),
+                            {"model", "x", "z" (world px of the model origin), "yaw" (deg), "cells"}
     {"type": "atlas", ...}  a re-rendered atlas (tile animations, palette fades)
     {"type": "map", "key": null}   no map any more
 
@@ -52,6 +54,7 @@ from websockets.http11 import Request, Response
 from .protocol import DEFAULT_PORT
 from .render import Renderer
 from .session import LiveSession
+from .props import place_props
 from .tilemap import build_atlas, build_diorama
 
 WEB_DIR = Path(__file__).parent / "web"
@@ -188,9 +191,11 @@ class FrameServer:
         now = time.monotonic()
         if tm.key != self._map_key:
             atlas = build_atlas(tm, st)
-            dio = build_diorama(tm, atlas)
+            props = place_props(tm, getattr(adapter, "prop_kit", ()))
+            dio = build_diorama(tm, atlas, props)
             meta = {"type": "map", "key": str(tm.key), "name": tm.name, "origin": list(tm.origin),
-                    "shape": list(tm.shape), "quads": int(len(dio.kinds))}
+                    "shape": list(tm.shape), "quads": int(len(dio.kinds)),
+                    "props": [p.to_dict() for p in props]}
             self._map_key, self._atlas, self._atlas_checked = tm.key, atlas, now
             self._map_parts = (meta, dio)
             self._map_msg = self._encode_map(atlas)

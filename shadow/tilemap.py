@@ -55,6 +55,7 @@ class TileMap:
     origin: tuple[int, int]       # world pixel of cell (0, 0)'s top-left corner
     metatiles: dict[int, Metatile]
     name: str = ""
+    tilesets: tuple = ()          # ids of the tilesets the metatiles come from (for prop kits)
 
     @property
     def shape(self) -> tuple[int, int]:
@@ -81,7 +82,7 @@ def _compose(entries, tiles: np.ndarray, palette: np.ndarray) -> tuple[np.ndarra
 @dataclass
 class Atlas:
     image: np.ndarray             # (H, W, 4) RGBA
-    slots: dict                   # (metatile id, "under" | "full" | "over") -> slot index
+    slots: dict                   # (metatile id, "under" | "full" | "over" | "base") -> slot index
     digest: str
 
     def uv(self, slot: int, row0: float = 0, row1: float = SLOT) -> tuple[float, float, float, float]:
@@ -108,6 +109,11 @@ def build_atlas(tm: TileMap, st: GBAState) -> Atlas:
         rgba = np.dstack([under, np.full((16, 16), 255, np.uint8)])
         slots[(mid, "under")] = len(images)
         images.append(rgba)
+        if mt.under_extra is not None:                   # bottom layer alone: floor under a prop
+            base = np.where(op[..., None], pal[idx], backdrop)
+            slots[(mid, "base")] = len(images)
+            images.append(np.dstack([base, np.full((16, 16), 255, np.uint8)]))
+        slots[(mid, "base")] = slots.get((mid, "base"), slots[(mid, "under")])
         if mt.over is not None:
             i3, o3 = _compose(mt.over, tiles, pal)
             if o3.any():
@@ -150,20 +156,27 @@ class Diorama:
     kinds: np.ndarray            # (n,) uint8: floor, face, top, card, side
 
 
-def build_diorama(tm: TileMap, atlas: Atlas) -> Diorama:
+def build_diorama(tm: TileMap, atlas: Atlas, props=()) -> Diorama:
+    """`props`: placed props (shadow/props.py). Their cells become plain floor (the
+    metatile's bottom layer) for the client to stand the models on."""
     rows, cols = tm.shape
     ox, oz = tm.origin
     q = _Quads()
     consumed = np.zeros((rows, cols), bool)
+    prop_cells = np.zeros((rows, cols), bool)
+    for p in props:
+        for r, c in p.cells:
+            prop_cells[r, c] = True
+    raised = tm.raised & ~prop_cells
 
     for x in range(cols):
         y = rows - 1
         while y >= 0:
-            if not tm.raised[y, x] or consumed[y, x]:
+            if not raised[y, x] or consumed[y, x]:
                 y -= 1
                 continue
             k = 1
-            while k < MAX_RUN and y - k >= 0 and tm.raised[y - k, x]:
+            while k < MAX_RUN and y - k >= 0 and raised[y - k, x]:
                 k += 1
             run = [y - j for j in range(k - 1, -1, -1)]          # north -> south
             consumed[run, x] = True
@@ -200,7 +213,7 @@ def build_diorama(tm: TileMap, atlas: Atlas) -> Diorama:
                 z0, z1 = oz + y * CELL, oz + (y + 1) * CELL
                 slot = atlas.slots["fill"]
                 for yy in [*range(y + 1, rows), *range(y - 1, -1, -1)]:
-                    if not tm.raised[yy, x] and (int(tm.cells[yy, x]), "under") in atlas.slots:
+                    if not raised[yy, x] and (int(tm.cells[yy, x]), "under") in atlas.slots:
                         slot = atlas.slots[(int(tm.cells[yy, x]), "under")]
                         break
                 q.add([(x0, 0, z0), (x1, 0, z0), (x1, 0, z1), (x0, 0, z1)],
@@ -212,8 +225,8 @@ def build_diorama(tm: TileMap, atlas: Atlas) -> Diorama:
             x0, x1 = ox + x * CELL, ox + (x + 1) * CELL
             z0, z1 = oz + y * CELL, oz + (y + 1) * CELL
             q.add([(x0, 0, z0), (x1, 0, z0), (x1, 0, z1), (x0, 0, z1)],
-                  atlas.uv(atlas.slots[(mid, "under")]), (0, 1, 0), KIND_FLOOR)
-            if (mid, "over") in atlas.slots:
+                  atlas.uv(atlas.slots[(mid, "base" if prop_cells[y, x] else "under")]), (0, 1, 0), KIND_FLOOR)
+            if (mid, "over") in atlas.slots and not prop_cells[y, x]:
                 zc = z1 + CARD_OFFSET
                 q.add([(x0, CELL, zc), (x1, CELL, zc), (x1, 0, zc), (x0, 0, zc)],
                       atlas.uv(atlas.slots[(mid, "over")]), (0, 0, 1), KIND_CARD)

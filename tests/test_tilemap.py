@@ -209,3 +209,44 @@ def test_server_sends_map_in_3d_view():
     assert sec["atlas"].shape[2] == 4
     fmeta, layers = got_frame
     assert fmeta["layers"] == ["sprites", "hud"] and fmeta["camera"]["origin"]
+
+
+# -- prop kit ---------------------------------------------------------------------------------
+def test_props_replace_furniture_cells():
+    from shadow.props import PropDef, place_props
+    st = GBAState()
+    synthetic_vram(st)
+    tm = synthetic_map()
+    # The table (metatile 2) is drawn on a second layer above a plain floor, like Emerald's
+    # "covered" metatiles; the kit replaces the 1x2 column of it with a model.
+    tm.metatiles[2] = Metatile(under=tuple(range(4, 8)), over=None, under_extra=tuple(range(100, 104)))
+    tm.tilesets = ("ts",)
+    kit = [PropDef("table", "ts", ((2,), (2,)), (8, 26)),
+           PropDef("other", "elsewhere", ((0,),), (8, 8))]          # another tileset: ignored
+    props = place_props(tm, kit)
+    assert [(p.model, p.position, p.cells) for p in props] == [("table", (-16 + 32 + 8, -16 + 48 + 26), [(3, 2), (4, 2)])]
+    assert props[0].to_dict()["cells"] == [[3, 2], [4, 2]]
+
+    atlas = build_atlas(tm, st)
+    assert atlas.slots[(2, "base")] != atlas.slots[(2, "under")]      # floor without the furniture
+    assert atlas.slots[(0, "base")] == atlas.slots[(0, "under")]
+    with_props = build_diorama(tm, atlas, props)
+    without = build_diorama(tm, atlas)
+    # No block for the table any more: its cells are floor with the bottom layer's art.
+    def table_faces(d):   # front faces in column 2 standing on row 4's south edge
+        return [f for f in d.positions[d.kinds == KIND_FACE] if f[0, 0] == 16 and f[0, 2] == 64]
+    assert table_faces(without) and not table_faces(with_props)
+    pic = rasterize(with_props, atlas, (-16, -16))
+    slot = atlas.slots[(2, "base")]
+    x, y = (slot % 32) * 16, (slot // 32) * 16
+    np.testing.assert_array_equal(pic[48:64, 32:48], atlas.image[y:y + 16, x:x + 16, :3])
+
+
+def test_emerald_prop_kit_matches_brendans_house_table():
+    from shadow.props import place_props
+    tm = TileMap(("k",), np.array([[0x201, 0x219, 0x21A, 0x21B, 0x21C],
+                                   [0x201, 0x221, 0x222, 0x223, 0x224]], np.uint16),
+                 np.zeros((2, 5), bool), (0, 0), {}, tilesets=(0x083DF884, pe.TILESET_BRENDANS_MAYS_HOUSE))
+    props = {(p.model, p.position, p.yaw) for p in place_props(tm, pe.PROP_KIT)}
+    assert props == {("prop_table", (48, 20), 0), ("prop_chair", (24, 13), 0), ("prop_chair", (24, 29), 0),
+                     ("prop_chair", (72, 13), 180), ("prop_chair", (72, 29), 180)}

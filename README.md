@@ -290,11 +290,38 @@ assets matched the original picture with 0 differing pixels.
 
 **Limits of the automatic version.** It only knows "walkable" and "impassable",
 not what an object is. So furniture becomes simple blocks whose height comes from
-how many cells it spans: Mom's 2x2 table is a tall box. The planned prop kit
-fixes that by swapping metatiles for real models, keyed by (tileset, metatile
-id). Outdoor maps work the same way, but elevation (cliffs) and map connections
+how many cells it spans. The prop kit (below) fixes that one piece of furniture at
+a time. Outdoor maps work the same way, but elevation (cliffs) and map connections
 aren't used yet. Sprites that aren't entities (effects, items) are drawn as a
 flat layer on top of the 3D scene.
+
+### Prop kit: real furniture models
+
+![Brendan's house table and chairs as 3D models: left, the game's view; right, turned](docs/3d-props.png)
+
+A prop kit swaps furniture drawn into the tiles for real 3D models. Each entry
+(`PropDef` in `shadow/props.py`) names a tileset, a pattern of metatile ids (a
+2x2 table, a single chair), the model, an anchor and a facing. The Emerald kit
+is `PROP_KIT` in `shadow/games/pokeemerald.py`. So far it has the dining table and
+the green chairs in Brendan's house (and the chairs in May's house).
+
+- Where a pattern matches, its cells lose their block and get a plain floor drawn
+  from the metatile's **bottom layer** only. Emerald draws furniture on the layer
+  above the floor, so this is the rug without the table, including the rug's own
+  drop shadows.
+- The map message lists the placed props (`props`: model, world x/z, yaw, cells),
+  and the client stands `shadow/web/models/<model>.glb` there.
+- Models: 1 Blender unit = one 16 px cell, origin at the centre of the footprint
+  on the floor, front/+x as in the art. Sizes are measured from the art as the
+  game's projection shows it, so from the game's point of view a model covers
+  about the same pixels as the original tiles.
+- `tools/model_props.py` builds `models/props/*.blend` from code (`make
+  props-blend`). The .blend files are then the source: edit them in Blender,
+  then `make models` exports them to `shadow/web/models/prop_*.glb`.
+
+Adding a prop: find the metatile ids (the map grid is in `gBackupMapLayout`;
+`tm.cells` in the adapter's `tilemap()`), measure the art, model it, and add a
+`PropDef`.
 
 ## Checking the renderer against mGBA
 
@@ -377,9 +404,10 @@ but a full HD pack at 60 fps needs the GPU port listed below.
   cover the model fully instead of blending. Screen fades done through
   palettes (most of Emerald's) darken the picture but not the models. The
   server would need to pass the fade level along for that.
-- **3D map prop kit.** Real 3D props per (tileset, metatile id) instead of
-  automatic blocks, a map exporter for modelling rooms in Blender, elevation
-  for outdoor cliffs, and stitching connected maps.
+- **3D maps.** More props for the prop kit (so far: Brendan's house table and
+  chairs; May's table has another cloth colour and no model yet), a map exporter
+  for modelling rooms in Blender, elevation for outdoor cliffs, and stitching
+  connected maps.
 - **More entities.** The Emerald adapter covers the player and NPCs, but only
   the mom has a kind (and a model) of her own. Next: more kinds, and a RAM
   inspector tool for games without a decompilation.
@@ -402,14 +430,19 @@ shadow/                 Python package (python -m shadow …)
   pack.py               hashing, replacement packs, dumper
   entities.py           Entity / World model, adapter interface
   tilemap.py            tile map -> 3D diorama, texture atlas, reference rasterizer
+  props.py              prop kit: furniture models in place of tiles
   rom.py                ROM file access (finds ROMs in roms/ by game code)
   games/                game adapters (pokeemerald.py, shadowtest.py)
   session.py            bridge connection + adapter selection
   server.py             WebSocket server (python -m shadow serve)
   web/index.html        three.js demo client
+  web/models/           exported .glb models (characters, prop_*.glb)
+models/                 Blender sources (characters; props/ for furniture)
   viewer.py             pygame window
   verify.py             renderer-vs-mGBA comparison
 tools/make_demo_pack.py demo pack generator
+tools/model_props.py    builds the prop .blend files from code
+tools/export_glb.py     .blend -> .glb (make models)
 testrom/                homebrew test ROM (C)
 harness/                headless libmgba runner (C)
 player/                 shadow-play: libmgba + SDL2 player that loads the bridge at startup (C)

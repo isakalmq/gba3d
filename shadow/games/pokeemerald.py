@@ -30,6 +30,7 @@ import numpy as np
 
 from ..entities import FACING_NAMES, Entity, oam_size, oam_slots_for_tiles
 from ..state import GBAState, MemoryNotWatched
+from ..props import PropDef
 from ..tilemap import Metatile, TileMap
 
 G_MAIN = 0x030022C0                # struct Main; callback2 at +4
@@ -63,6 +64,20 @@ FLAT_BEHAVIORS = frozenset(range(0x10, 0x18)) | frozenset(range(0x38, 0x40))
 # characters are kind "npc" and carry their graphics id in props.
 KIND_BY_GRAPHICS_ID = {215: "mom"}           # OBJ_EVENT_GFX_MOM
 
+# Prop kit: models in place of furniture drawn into the tiles (shadow/props.py). Keyed by
+# tileset (ROM address) + metatile ids; anchors and sizes measured from the original art.
+TILESET_BRENDANS_MAYS_HOUSE = 0x083DFAF4     # gTileset_BrendansMaysHouse (secondary)
+PROP_KIT = (
+    # Brendan's house 1F: the 2x2 dining table on the rug (28x24 px, top 8 px up)...
+    PropDef("prop_table", TILESET_BRENDANS_MAYS_HOUSE, ((0x21A, 0x21B), (0x222, 0x223)), (16, 20)),
+    # ...and its green chairs: the left ones face east, the right ones west.
+    *(PropDef("prop_chair", TILESET_BRENDANS_MAYS_HOUSE, ((m,),), (8, 13), 0) for m in (0x219, 0x221)),
+    *(PropDef("prop_chair", TILESET_BRENDANS_MAYS_HOUSE, ((m,),), (8, 13), 180) for m in (0x21C, 0x224)),
+    # May's house 1F (mirrored layout, same chairs; its table has another cloth colour).
+    PropDef("prop_chair", TILESET_BRENDANS_MAYS_HOUSE, ((0x2C0,),), (8, 13), 0),
+    PropDef("prop_chair", TILESET_BRENDANS_MAYS_HOUSE, ((0x2C3,),), (8, 13), 180),
+)
+
 AVATAR_FLAGS = ["on_foot", "mach_bike", "acro_bike", "surfing", "underwater",
                 "controllable", "forced_move", "dash"]
 
@@ -88,6 +103,7 @@ class PokemonEmeraldAdapter:
     # Overworld BGs (sOverworldBgTemplates): BG0 = text boxes / menus (priority 0),
     # BG1 = map top layer (1), BG2/BG3 = map middle/bottom layers (2/3).
     hud_bgs = frozenset({0})
+    prop_kit = PROP_KIT
 
     def __init__(self):
         self._tileset_cache: dict = {}
@@ -130,7 +146,8 @@ class PokemonEmeraldAdapter:
         raised = (collision != 0) & ~np.isin(ids, list(flat)) & ~undefined
         key = (layout, width, height, hashlib.blake2b(grid.tobytes(), digest_size=8).hexdigest())
         origin = (-MAP_OFFSET * 16, -MAP_OFFSET * 16)  # cell (0, 0) is map tile (-7, -7)
-        return TileMap(key, ids.astype(np.uint16), raised, origin, metatiles, name=f"layout {layout:08X}")
+        return TileMap(key, ids.astype(np.uint16), raised, origin, metatiles, name=f"layout {layout:08X}",
+                       tilesets=(primary, secondary))
 
     def _metatile(self, rom, primary: int, secondary: int, mid: int):
         cache_key = (primary, secondary, mid)

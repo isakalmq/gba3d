@@ -341,9 +341,39 @@ function setAtlas(atlas, shape) {
   mapTex.needsUpdate = true;
 }
 
+// Props: real models standing in for furniture drawn into the tiles (shadow/props.py).
+// The server has already replaced their cells with plain floor. Model units are 16 px
+// cells, origin at the footprint's centre on the floor.
+const PROP_SCALE = 16;
+const propModels = {};                     // model name -> Promise<Object3D | null>
+const propGroup = new THREE.Group();
+worldScene.add(propGroup);
+worldScene.add(new THREE.HemisphereLight(0xffffff, 0x445566, 1.4));   // same light as the characters
+const worldSun = new THREE.DirectionalLight(0xffffff, 1.8);
+worldSun.position.set(-1, 2, 1.5);
+worldScene.add(worldSun);
+function propModel(name) {
+  return propModels[name] ??= loader.loadAsync(`models/${name}.glb`).then((g) => g.scene)
+    .catch((err) => { console.warn(`prop ${name} failed to load`, err); return null; });
+}
+function setProps(list, key) {
+  propGroup.clear();
+  for (const p of list ?? []) {
+    propModel(p.model).then((m) => {
+      if (!m || mapInfo?.key !== key) return;
+      const o = m.clone();
+      o.scale.setScalar(PROP_SCALE);
+      o.position.set(p.x, 0, p.z);
+      o.rotation.y = THREE.MathUtils.degToRad(p.yaw);
+      propGroup.add(o);
+    });
+  }
+}
+
 function setMap(meta, s) {
   if (mapMesh) { worldScene.remove(mapMesh); mapMesh.geometry.dispose(); mapMesh = null; }
   mapInfo = meta.key ? meta : null;
+  setProps(meta.props, meta.key);
   if (!meta.key) return;
   setAtlas(s.atlas.data, s.atlas.shape);
   const n = meta.quads;
