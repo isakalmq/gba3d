@@ -323,6 +323,19 @@ Adding a prop: find the metatile ids (the map grid is in `gBackupMapLayout`;
 `tm.cells` in the adapter's `tilemap()`), measure the art, model it, and add a
 `PropDef`.
 
+## Screenshots without a ROM
+
+`tools/emerald_fixture.py` builds a realistic Emerald game state for any map from the
+pret/pokeemerald decompilation (fetched on demand into the git-ignored `build/`), and
+`tools/screenshot.py` captures the web client with it in headless Chromium, including
+turned views:
+
+```bash
+python3 tools/screenshot.py LittlerootTown_BrendansHouse_1F --player 5,4 --orbit 0.6,-0.25
+```
+
+See `CLAUDE.md` for the full workflow (live screenshots, debug hooks, measuring).
+
 ## Checking the renderer against mGBA
 
 The bridge can also save full snapshots plus mGBA's own screenshot of the same
@@ -443,6 +456,8 @@ models/                 Blender sources (characters; props/ for furniture)
 tools/make_demo_pack.py demo pack generator
 tools/model_props.py    builds the prop .blend files from code
 tools/export_glb.py     .blend -> .glb (make models)
+tools/emerald_fixture.py  Emerald game state for any map, from the decomp (no ROM)
+tools/screenshot.py     web client screenshots (fixture or running server)
 testrom/                homebrew test ROM (C)
 harness/                headless libmgba runner (C)
 player/                 shadow-play: libmgba + SDL2 player that loads the bridge at startup (C)
