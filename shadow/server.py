@@ -18,7 +18,8 @@ draw its own models in the game's own draw order (n = 0 means the layer is empty
 Draw behind, then the models, then front, then hud. Clients can send
 {"hide_entity_sprites": false} to get a single unsplit frame with the original sprites.
 
-GET / serves a small three.js demo client (shadow/web/index.html).
+GET / serves a small three.js demo client (shadow/web/index.html); GET /models/<name>.glb
+serves its models from shadow/web/models/.
 """
 from __future__ import annotations
 
@@ -97,6 +98,14 @@ class FrameServer:
             headers = Headers([("Content-Type", "text/html; charset=utf-8"),
                                ("Content-Length", str(len(body))), ("Cache-Control", "no-cache")])
             return Response(200, "OK", headers, body)
+        if request.path.startswith("/models/"):
+            name = request.path.removeprefix("/models/")
+            path = WEB_DIR / "models" / name
+            if "/" not in name and name.endswith(".glb") and path.is_file():
+                body = path.read_bytes()
+                headers = Headers([("Content-Type", "model/gltf-binary"),
+                                   ("Content-Length", str(len(body))), ("Cache-Control", "no-cache")])
+                return Response(200, "OK", headers, body)
         return connection.respond(404, "not found\n")
 
     async def _handler(self, ws: ServerConnection) -> None:

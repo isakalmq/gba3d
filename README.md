@@ -184,7 +184,7 @@ an overlay: **E** toggles the overlay and **H** hides the entities' sprites.
 
    | field    | meaning |
    |----------|---------|
-   | `id`, `kind` | stable id (`"player"`) and type |
+   | `id`, `kind` | stable id and type: `"player"`; Emerald NPCs are `"<kind>:<mapGroup>.<mapNum>.<localId>"` with kind `"mom"` or `"npc"` |
    | `screen` | anchor point on the GBA screen (middle of the feet) |
    | `pos`    | the same point in world pixels (Emerald: map pixels, origin at the map's top-left) |
    | `tile`   | the tile the game thinks the entity is on |
@@ -216,8 +216,11 @@ matches its sprite on every frame (and without it, it doesn't).
 - US English Emerald only (game code `BPEE`). Addresses come from the
   [pret/pokeemerald](https://github.com/pret/pokeemerald) decompilation's symbol
   map. Other languages need their own addresses.
-- Player only, and only while the overworld is running (`gMain.callback2 ==
-  CB2_Overworld`). There are no entities in battles or menus.
+- The player (always the first entity) and every other active object event whose
+  sprite is on screen, only while the overworld is running (`gMain.callback2 ==
+  CB2_Overworld`). There are no entities in battles or menus. NPC kinds come from
+  their graphics id (`KIND_BY_GRAPHICS_ID`: 215 is `"mom"`; everything else is
+  `"npc"`, with `graphics_id` and `local_id` in `props`).
 - `pos` is exact and smooth. It's derived from the sprite position and the
   camera's scroll counters the same way the game places field sprites. It
   changes frame of reference when you cross into a connected map (the `map`
@@ -318,9 +321,9 @@ but a full HD pack at 60 fps needs the GPU port listed below.
   cover the model fully instead of blending. Screen fades done through
   palettes (most of Emerald's) darken the picture but not the models. The
   server would need to pass the fade level along for that.
-- **More entities.** The Emerald adapter only covers the player. NPCs are the
-  same `gObjectEvents` table (and the same maths), so they're the natural next
-  step, followed by a RAM inspector tool for games without a decompilation.
+- **More entities.** The Emerald adapter covers the player and NPCs, but only
+  the mom has a kind (and a model) of her own. Next: more kinds, and a RAM
+  inspector tool for games without a decompilation.
 - **Metasprites.** Sprite *replacements* are still per OAM entry. Entities
   already know all the slots that draw them, so whole-character replacements
   can build on that.

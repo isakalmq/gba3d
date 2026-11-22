@@ -13,3 +13,4 @@ roms/*
 !roms/README.md
 *.sav
 *.ss[0-9]
+models/*.blend1

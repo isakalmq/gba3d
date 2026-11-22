@@ -149,6 +149,40 @@ def test_emerald_player_mid_step_moves_smoothly():
     assert p.moving
 
 
+def add_npc(st, *, index, sprite, graphics_id, local_id, tile, sprite_xy, tiles_at, facing=1, flags=0):
+    """An NPC object event + sprite, drawn by one hardware sprite in OAM slot 20 + index."""
+    oe = pe.G_OBJECT_EVENTS + index * pe.OBJECT_EVENT_SIZE
+    poke(st, oe, "BBBBBBBBBBB", 1, flags, 0, 0, sprite, graphics_id, 0, 0, local_id, 1, 0)
+    poke(st, oe + 0x10, "hhhh", tile[0] + 7, tile[1] + 7, tile[0] + 7, tile[1] + 7)
+    poke(st, oe + 0x18, "H", facing | (facing << 4))
+    spr = pe.G_SPRITES + sprite * pe.SPRITE_SIZE
+    poke(st, spr, "HHH", (2 << 14), (2 << 14), tiles_at | (3 << 12))
+    poke(st, spr + 0x20, "hhhhbb", sprite_xy[0], sprite_xy[1], 0, 0, -8, -16)
+    poke(st, spr + 0x3E, "B", 0b11)
+    slot = 20 + index
+    st.oam16[slot * 4], st.oam16[slot * 4 + 2] = 0x0000, tiles_at | (3 << 12)
+
+
+def test_emerald_npcs_follow_the_player():
+    total = (-16, 32)
+    sx, sy = sprite_pos_for((10, 5), (160, 80), total)
+    st = emerald_state(map_tile=(10, 5), prev_tile=(10, 5), cam_tile=(10, 5), field_cam=(0, 0),
+                       total_offset=total, sprite_xy=(sx, sy))
+    mx, my = sprite_pos_for((7, 3), (160, 80), total)
+    add_npc(st, index=0, sprite=6, graphics_id=215, local_id=1, tile=(7, 3), sprite_xy=(mx, my), tiles_at=0x80)
+    add_npc(st, index=1, sprite=7, graphics_id=16, local_id=2, tile=(12, 6), sprite_xy=(sx + 32, sy + 16),
+            tiles_at=0xC0, facing=3)
+    add_npc(st, index=3, sprite=8, graphics_id=19, local_id=3, tile=(40, 6), sprite_xy=(300, sy),
+            tiles_at=0x100, flags=0x40)                        # offScreen: skipped
+    p, mom, npc = extract_world(pe.ADAPTER, st).entities
+    assert p.id == "player"
+    assert (mom.id, mom.kind, mom.tile, mom.facing) == ("mom:0.1.1", "mom", (7, 3), "down")
+    assert mom.pos == (7 * 16 + 8, 3 * 16 + 16)
+    assert mom.oam == [20] and mom.size == (16, 32) and not mom.moving
+    assert mom.props["graphics_id"] == 215 and mom.props["event_map"] == (0, 1)
+    assert (npc.kind, npc.facing, npc.oam) == ("npc", "left", [21])
+
+
 def test_emerald_not_in_overworld():
     st = emerald_state(map_tile=(1, 1), prev_tile=(1, 1), cam_tile=(1, 1), field_cam=(0, 0),
                        total_offset=(0, 0), sprite_xy=(0, 0))

@@ -20,7 +20,10 @@
     white-space: pre-wrap; color: var(--muted); max-height: 35vh; overflow: auto; }
 </style>
 <script type="importmap">
-  { "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+  { "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  } }
 </script>
 </head>
 <body>
@@ -36,6 +39,8 @@
 </details>
 <script type="module">
 import * as THREE from "three";
+import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import * as SkeletonUtils from "three/addons/utils/SkeletonUtils.js";
 
 // The game picture stays exactly as on the GBA (240x160, letterboxed to the
 // window). Models are drawn by a separate orthographic camera that looks down
@@ -115,18 +120,102 @@ function fitBox([x0, y0, x1, y1]) {
   return { w, d, h, cx: (x0 + x1) / 2, bottom: y1 };
 }
 
+// Fit a real model (uniform scale) over the drawn art: measure its silhouette as
+// the tilted camera sees it at the current yaw, scale it so the silhouette is as
+// tall as the art, and place it so its lowest point sits on the art's bottom line
+// and it is centered horizontally. Screen "up" of a point is y*cos - z*sin.
+function fitModel(points, yaw, [x0, y0, x1, y1]) {
+  const t = THREE.MathUtils.degToRad(angle), ct = Math.cos(t), st = Math.sin(t);
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  let pmin = Infinity, pmax = -Infinity, xmin = Infinity, xmax = -Infinity;
+  for (let i = 0; i < points.length; i += 3) {
+    const x = points[i], y = points[i + 1], z = points[i + 2];
+    const rx = x * cy + z * sy, rz = -x * sy + z * cy;     // rotation.y = yaw
+    const p = y * ct - rz * st;
+    if (p < pmin) pmin = p;
+    if (p > pmax) pmax = p;
+    if (rx < xmin) xmin = rx;
+    if (rx > xmax) xmax = rx;
+  }
+  const s = Math.max(4, y1 - y0) / (pmax - pmin);
+  // Screen point of the model's origin (screen y grows downwards).
+  return { s, sx: (x0 + x1) / 2 - s * (xmin + xmax) / 2, sy: y1 + s * pmin, h: s * (pmax - pmin) };
+}
+
 const COLORS = { player: 0xff5ca8 };
 const FACING_YAW = { down: 0, right: Math.PI / 2, up: Math.PI, left: -Math.PI / 2 };
 const actors = new Map();
 
+// Models per entity kind (shadow/web/models/<file>, exported from models/*.blend
+// with `make models`), front facing +z. Each is centered with its feet at y=0 and
+// keeps its own proportions: it is scaled uniformly so its silhouette spans the
+// drawn art (see fitModel). Kinds without a model, or whose model hasn't loaded
+// yet, get the cube. A "Walk" animation, if the model has one, plays while the
+// entity moves and fades back to the rest pose when it stops.
+const MODEL_FILES = { player: "player.glb", mom: "mom.glb" };
+// The Walk clip is two steps; the game takes 16 frames (at 59.73 Hz) per step.
+const STEP_SECONDS = 16 / 59.73;
+const models = {};   // kind -> { scene, points, walk }
+const loader = new GLTFLoader();
+for (const [kind, file] of Object.entries(MODEL_FILES)) {
+  loader.load(`models/${file}`, (gltf) => {
+    const root = gltf.scene;
+    const box = new THREE.Box3().setFromObject(root);
+    const center = box.getCenter(new THREE.Vector3());
+    const norm = new THREE.Group();
+    root.position.set(-center.x, -box.min.y, -center.z);
+    norm.add(root);
+    norm.updateMatrixWorld(true);
+    // Every vertex, for measuring the exact on-screen silhouette.
+    const pts = [], v = new THREE.Vector3();
+    norm.traverse((o) => {
+      const pos = o.isMesh && o.geometry.attributes.position;
+      if (!pos) return;
+      for (let i = 0; i < pos.count; i++) {
+        v.fromBufferAttribute(pos, i).applyMatrix4(o.matrixWorld);
+        pts.push(v.x, v.y, v.z);
+      }
+    });
+    models[kind] = { scene: norm, points: new Float32Array(pts),
+                     walk: gltf.animations.find((c) => c.name === "Walk") ?? null };
+    for (const a of actors.values()) if (a.userData.kind === kind) setBody(a, kind);
+  }, undefined, (err) => console.warn(`model ${file} failed to load; using a cube`, err));
+}
+
+function setBody(group, kind) {
+  const d = group.userData;
+  if (d.body) group.remove(d.body);
+  if (d.nose) group.remove(d.nose);
+  d.nose = null;
+  d.mixer = d.walk = null;
+  if (models[kind]) {
+    const m = models[kind];
+    const inst = SkeletonUtils.clone(m.scene);
+    inst.traverse((o) => { if (o.isMesh) o.frustumCulled = false; });   // bounds don't follow the bones
+    d.body = new THREE.Group();                 // per-frame fit scale goes here
+    d.body.add(inst);
+    d.body.userData.points = m.points;
+    if (m.walk) {
+      d.mixer = new THREE.AnimationMixer(inst);
+      d.walk = d.mixer.clipAction(m.walk);
+      d.walk.timeScale = m.walk.duration / (2 * STEP_SECONDS);
+      d.walk.setEffectiveWeight(0).play();
+      d.walkWeight = 0;
+    }
+    group.add(d.body);
+    return;
+  }
+  d.body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
+    new THREE.MeshStandardMaterial({ color: COLORS[kind] ?? 0x5cc8ff, roughness: 0.5 }));
+  d.nose = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 16), new THREE.MeshStandardMaterial({ color: 0xffffff }));
+  d.nose.rotation.x = Math.PI / 2;
+  group.add(d.body, d.nose);
+}
+
 function makeActor(e) {
   const group = new THREE.Group();
-  const body = new THREE.Mesh(new THREE.BoxGeometry(1, 1, 1),
-    new THREE.MeshStandardMaterial({ color: COLORS[e.kind] ?? 0x5cc8ff, roughness: 0.5 }));
-  const nose = new THREE.Mesh(new THREE.ConeGeometry(1, 2, 16), new THREE.MeshStandardMaterial({ color: 0xffffff }));
-  nose.rotation.x = Math.PI / 2;
-  group.add(body, nose);
-  group.userData = { box: [0, 0, 0, 0], shown: null, yaw: 0, moving: false, phase: 0, body, nose };
+  group.userData = { kind: e.kind, box: [0, 0, 0, 0], shown: null, yaw: 0, moving: false, phase: 0, body: null, nose: null };
+  setBody(group, e.kind);
   modelScene.add(group);
   return group;
 }
@@ -146,8 +235,15 @@ function updateActors(entities) {
     seen.add(e.id);
     const a = actors.get(e.id) ?? actors.set(e.id, makeActor(e)).get(e.id);
     const d = a.userData;
-    d.box = entityBox(e);
-    d.shown ??= [...d.box];
+    // Position follows the entity's anchor exactly, in step with the picture (the
+    // scroll moves both by whole pixels on the same frame). Only the art's box
+    // relative to the anchor is smoothed: it changes with animation frames.
+    // A box clipped by the screen edge is ignored so the model doesn't shrink.
+    const box = entityBox(e);
+    d.anchor = e.screen;
+    if (!d.rel || (box[0] > 0 && box[1] > 0 && box[2] < W && box[3] < H))
+      d.rel = [box[0] - e.screen[0], box[1] - e.screen[1], box[2] - e.screen[0], box[3] - e.screen[1]];
+    d.relShown ??= [...d.rel];
     if (e.facing in FACING_YAW) d.yaw = FACING_YAW[e.facing];
     d.moving = e.moving;
   }
@@ -204,8 +300,9 @@ function resize() { renderer.setSize(window.innerWidth, window.innerHeight); }
 window.addEventListener("resize", resize);
 resize();
 
-// For tests and debugging: window.gbaShadow.picture = false hides the game picture.
-const debug = window.gbaShadow = { picture: true };
+// For tests and debugging: window.gbaShadow.picture = false hides the game picture,
+// window.gbaShadow.updateActors([...]) places models without a game running.
+const debug = window.gbaShadow = { picture: true, updateActors };
 
 const clock = new THREE.Clock();
 const tmp = new THREE.Vector3();
@@ -213,22 +310,46 @@ renderer.setAnimationLoop(() => {
   const dt = Math.min(clock.getDelta(), 0.1);
   for (const a of actors.values()) {
     const d = a.userData;
-    const k = 1 - Math.exp(-dt * 30);                  // smooth out 60 Hz steps
-    for (let i = 0; i < 4; i++) d.shown[i] += (d.box[i] - d.shown[i]) * k;
-    const f = fitBox(d.shown);
-    // Front edge of the footprint on the art's bottom line.
-    a.position.copy(groundFromScreen(f.cx, f.bottom, tmp));
-    a.position.z -= f.d / 2;
+    d.shown ??= [0, 0, 0, 0];
+    const k = 1 - Math.exp(-dt * 30);                  // smooth changes in the art's shape
+    for (let i = 0; i < 4; i++) {
+      d.relShown[i] += (d.rel[i] - d.relShown[i]) * k;
+      d.shown[i] = d.anchor[i % 2] + d.relShown[i];
+    }
     let dy = d.yaw - a.rotation.y;
     dy = Math.atan2(Math.sin(dy), Math.cos(dy));
     a.rotation.y += dy * (1 - Math.exp(-dt * 15));
     d.phase = d.moving ? d.phase + dt * 14 : 0;
+    const points = d.body.userData.points;
+    if (points) {
+      const m = fitModel(points, a.rotation.y, d.shown);
+      a.position.copy(groundFromScreen(m.sx, m.sy, tmp));
+      d.body.scale.setScalar(m.s);
+      if (d.mixer) {
+        // Fade the walk in and out; it keeps its place in the cycle while stopped,
+        // so brief stops between steps don't restart the stride.
+        d.walkWeight += ((d.moving ? 1 : 0) - d.walkWeight) * (1 - Math.exp(-dt * 12));
+        d.walk.setEffectiveWeight(d.walkWeight);
+        d.walk.paused = d.walkWeight < 0.01;
+        d.mixer.update(dt);
+        d.body.position.y = 0;
+      } else {
+        d.body.position.y = Math.abs(Math.sin(d.phase)) * Math.min(1.5, m.h * 0.06);
+      }
+      continue;
+    }
+    const f = fitBox(d.shown);
+    // Front edge of the footprint on the art's bottom line.
+    a.position.copy(groundFromScreen(f.cx, f.bottom, tmp));
+    a.position.z -= f.d / 2;
     const bob = Math.abs(Math.sin(d.phase)) * Math.min(1.5, f.h * 0.06);
     d.body.scale.set(f.w, f.h, f.d);
     d.body.position.y = f.h / 2 + bob;
-    const r = Math.max(1, Math.min(f.w, f.h) * 0.18);
-    d.nose.scale.set(r, r, r);
-    d.nose.position.set(0, f.h * 0.6 + bob, f.d / 2 + r);
+    if (d.nose) {
+      const r = Math.max(1, Math.min(f.w, f.h) * 0.18);
+      d.nose.scale.set(r, r, r);
+      d.nose.position.set(0, f.h * 0.6 + bob, f.d / 2 + r);
+    }
   }
 
   // Letterbox the 240x160 picture into the window.
