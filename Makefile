@@ -1,13 +1,16 @@
 PYTHON ?= python3
 CAPTURES ?= build/captures
 
-all: rom harness
+all: rom harness host
 
 rom:
 	$(MAKE) -C testrom
 
 harness:
 	$(MAKE) -C harness
+
+host:
+	$(MAKE) -C host
 
 # Capture ~120 frames of the test ROM headlessly, then compare the renderer against mGBA.
 selftest: all
@@ -22,6 +25,7 @@ test:
 clean:
 	$(MAKE) -C testrom clean
 	$(MAKE) -C harness clean
+	$(MAKE) -C host clean
 	rm -rf build
 
-.PHONY: all rom harness selftest test clean
+.PHONY: all rom harness host selftest test clean

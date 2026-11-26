@@ -8,3 +8,7 @@ build/
 dumps/
 captures/
 shadow_*.png
+host/libgbahost.so
+*.gba.ss1
+*.ss1
+*.sav

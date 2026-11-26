@@ -59,6 +59,43 @@ matter: the script retries the connection every 60 frames.
 Viewer keys: **B** sprite boxes (green = replaced, yellow = original, blue = OBJ window),
 **R** toggle replacements, **S** screenshot, **Esc** quit.
 
+## Emerald bridge (snapshots up, intents down)
+
+A second pipeline, specific to Pokémon Emerald (US), for a client that draws its own
+world (eventually 3D) and drives the real game underneath. The client embeds mGBA
+and steps it one frame at a time. Each frame it reads a **snapshot** of what is true
+(map, player, NPCs, control mode, dialogue, menus) and sends **intents** ("go to this
+tile", "talk to NPC 3", "pick option 1"), which a controller next to the emulator turns
+into button presses. Battles and menus fall back to showing the GBA screen.
+Design and status: [docs/emerald-bridge.md](docs/emerald-bridge.md).
+
+![debug client: top-down mirror built from snapshots, with the walk path, and the GBA screen](docs/emerald-demo.png)
+
+```bash
+make host                                   # builds host/libgbahost.so (needs libmgba-dev)
+python -m emerald view --demo               # try the debug client against a built-in fake game
+python -m emerald view emerald.gba --save emerald.sav
+python -m emerald probe emerald.gba --state overworld.ss1   # print one snapshot as JSON
+```
+
+In the debug client, left-click a tile to walk there (shift = exact tile), right-click
+an NPC to talk to them, press Space to advance text and 0–9 to answer a menu. Arrows/Z/X/Enter
+are passed straight to the game. F5/F9 save/load a state.
+
+```python
+from emerald.host import EmeraldHost
+from emerald.controller import goto, interact, advance_text, choose
+
+host = EmeraldHost("emerald.gba")
+host.submit(goto(10, 8))          # approximate targets snap to the nearest reachable tile
+while True:
+    r = host.step()               # exactly one GBA frame
+    r.snapshot.player, r.snapshot.objects, r.snapshot.text, r.events, r.finished
+```
+
+The ROM isn't included. Tests that need it run when `EMERALD_ROM` is set
+(`tests/test_emerald_rom.py`); everything else is tested against `emerald/fake.py`.
+
 ## Making replacement graphics
 
 1. Play the game with dumping on:
@@ -183,9 +220,21 @@ shadow/                 Python package (python -m shadow …)
   pack.py               hashing, replacement packs, dumper
   viewer.py             pygame window
   verify.py             renderer-vs-mGBA comparison
+  core.py               in-process mGBA core (ctypes over host/libgbahost.so)
+emerald/                Emerald bridge (python -m emerald …)
+  data/bpee.json        symbols + constants from the decomp (tools/gen_emerald_data.py)
+  snapshot.py           memory -> Snapshot (mode, player, NPCs, text, menu)
+  mapgrid.py            live collision grid + A* pathfinding
+  controller.py         intents -> button presses (closed loop)
+  events.py             snapshot diff -> events
+  host.py               frame-locked loop
+  debugview.py          top-down pygame client
+  fake.py               ROM-free stand-in used by tests and --demo
 tools/make_demo_pack.py demo pack generator
+tools/gen_emerald_data.py regenerates emerald/data/bpee.json
 testrom/                homebrew test ROM (C)
 harness/                headless libmgba runner (C)
+host/                   libgbahost.so: flat C API over libmgba
 tests/                  pytest suite + mGBA capture fixtures
 ```
 
